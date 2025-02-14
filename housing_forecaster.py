@@ -305,6 +305,28 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
             time.sleep(2 ** attempt)  # Exponential backoff
             continue
 
+def calculate_location_premium(distance_km, public_transport_score):
+    """
+    Calculate location-based price growth premium considering:
+    - Non-linear distance decay from CBD
+    - Public transport accessibility offset
+    - Combined interaction effects
+    """
+    # Base distance decay using sigmoid function
+    # Steeper decline 0-10km, gradual 10km+ 
+    base_distance_impact = 0.015 / (1 + np.exp(0.3 * (distance_km - 8)))
+    
+    # Transport accessibility premium
+    # Scale: 0.001 (poor) to 0.008 (excellent)
+    transport_premium = (public_transport_score / 10) * 0.008
+    
+    # Interaction boost for well-connected outer areas
+    interaction_boost = 0
+    if distance_km > 15 and public_transport_score >= 7:
+        interaction_boost = 0.003
+        
+    return base_distance_impact + transport_premium + interaction_boost
+
 def fine_tune_model(model, new_data):
     """Incremental training with new suburb data including supply metrics"""
     # Select features including supply ratio
@@ -394,7 +416,13 @@ def forecast_prices(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, lan
         suburb_data['population_growth'] * 0.004 +  # Population growth has strong impact
         suburb_data['infrastructure_score'] * 0.003 +  # Good infrastructure supports growth
         suburb_data['school_quality'] * 0.002 +  # Quality schools attract families
-        suburb_data['public_transport'] * 0.0015 -  # Access increases demand
+        suburb_data.apply(
+            lambda row: calculate_location_premium(
+                row['distance_to_cbd'], 
+                row['public_transport']
+            ),
+            axis=1
+        ) - # Non-linear distance decay and public transport premium
         suburb_data['flood_risk'] * 0.002 -  # Risk factors reduce growth
         suburb_data['climate_risk'] * 0.002 + # Climate impact on long-term value
         supply_impact  # Supply impact on growth refer above

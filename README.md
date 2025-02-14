@@ -22,12 +22,24 @@ This Machine Learning powered application uses finetuned XGBoost advanced regres
 ### Advanced Analytics
 - 50-year price projections with confidence intervals
 - Monte Carlo simulations for price modeling
+- Multiple confidence intervals (1 Std.d 68% and 2 Std.d 95%)
 - Key market indicators:
   - School quality scores
   - Infrastructure ratings
   - Flood and climate risk assessments
   - Population growth trends
   - Public transport accessibility
+  - Distance to CBD based decay
+  - Supply Market Analysis
+    - Current months of housing inventory
+    - Supply ratio benchmarking against 6-month standard
+    - Dynamic growth adjustments based on supply conditions
+
+### Model Fine-tuning
+- Progressive learning with synthetic data generation
+- Supply-aware parameter adjustments
+- Volatility modeling for different market conditions
+- Confidence interval calculations using Monte Carlo simulations
 
 ### Data Export Options
 - JSON: Complete dataset with all metrics
