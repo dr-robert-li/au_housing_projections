@@ -1,0 +1,10 @@
+gradio
+pandas
+numpy
+matplotlib
+huggingface-hub
+joblib
+xgboost
+scikit-learn
+requests
+python-dotenv
