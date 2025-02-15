@@ -1,8 +1,10 @@
 # 🏡 Australian Suburb Housing Price Forecaster
-### Version 1.2
+### Version 1.3
 ### Author: Robert Li ([dr-robert-li](https://github.com/dr-robert-li/))
     
 This Machine Learning powered application uses finetuned XGBoost advanced regression model and a hedonic model of valuation to forecast housing prices for Australian suburbs over a 50-year period using machine learning and real estate market data.
+
+**Note:** This application is very compute, memory and time intensive. It can consume API credits very quickly. Use with care. It is recommended to use a GPU or a machine with at least 16GB of RAM. Each suburb may take several minutes to generate a response.
 
 ## Features
 
@@ -53,6 +55,17 @@ This Machine Learning powered application uses finetuned XGBoost advanced regres
     - Current months of housing inventory
     - Supply ratio benchmarking against 6-month standard
     - Dynamic growth adjustments based on supply conditions
+
+### Market Cycle Modeling
+- Default to ABS data but will otherwise use a market cycle model:
+  - 10-Year Market Cycles
+    - Years 1-3: Strong boom phase (+4-6% above baseline)
+    - Years 4-6: Moderate growth (+1-2% above baseline)
+    - Years 7-8: Market slowdown (-1-3% below baseline)
+    - Years 9-10: Sharp correction (-3-5% below baseline)
+  - Long-term average growth maintained at 3.5%
+  - Volatility modeling with 0.8% random variation
+  - Realistic boom-bust patterns based on historical data
 
 ### Optional Deep Market Reasoning
 - Comprehensive market analysis for each suburb:

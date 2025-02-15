@@ -6,7 +6,7 @@ import csv
 import re
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 from typing import Optional
 import logging
@@ -104,45 +104,47 @@ def clean_numeric_value(value):
         return float(value.replace(',', ''))
     return float(value)
 
-def fetch_top_growth_suburbs(state=None, limit=10, retries=3, verbose: Optional[bool] = None):
+def fetch_top_growth_suburbs(state=None, limit=5, max_price=None, retries=3, verbose: Optional[bool] = None):
+    # Add default return value
+    suburbs = []
+    
     if verbose is not None:
         set_verbose(verbose)
+
+    price_constraint = f"with median prices under ${max_price:,.0f} " if max_price else ""
     
     payload = {
         "model": "sonar-pro",
         "messages": [
             {
-                "role": "system",
+                "role": "system", 
                 "content": "You are an expert Australian real estate analyst. Return only a clean JSON array of suburb strings without any additional text or reasoning."
             },
             {
                 "role": "user",
-                "content": f"Return a JSON array of exactly {limit} top growth suburbs" +
-                          "for the last 12 months " + # bias recency   
+                "content": f"Return a JSON array of exactly {limit} top Australian growth suburbs" +
+                          "for the last 12 months " +
                           (f"in {state} " if state else "in Australia ") +
+                          price_constraint +
                           "based on projected 5-year growth rate. " +
                           "Format each suburb as 'Suburb STATE' where STATE is the 2-3 letter code. " +
                           "Return only the JSON array, no additional text."
             }
         ],
-        "temperature": 0.2,
-        # "top_k": 4
-        # "search_recency_filter": "month"
+        "temperature": 0.2
     }
-    
+
     for attempt in range(retries):
         try:
             response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS)
             response.raise_for_status()
+            
             logging.debug(f"State: {state if state else 'All Australia'}")
             logging.debug(f"Limit: {limit}")
+            logging.debug(f"Max Price: {max_price if max_price else 'No limit'}")
             logging.debug(f"Attempt: {attempt + 1}/{retries}")
-            log_api_response(payload, response)
+            log_api_response(state if state else "All Australia", payload, response)
 
-            # strip CoT
-            if '<think>' in response:
-                response = response.split('```json')[1].split('```')[0]
-            
             data = response.json()
             content = data['choices'][0]['message']['content']
             
@@ -152,23 +154,16 @@ def fetch_top_growth_suburbs(state=None, limit=10, retries=3, verbose: Optional[
             
             suburbs = json.loads(json_str)
             return suburbs[:limit]
-        
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON parsing error: {str(e)}")
-            logging.error(f"Raw response:\n{response.text}")
-            if attempt == retries - 1:
-                raise gr.Error(f"Invalid response format for {state if state else 'Australia'}.")
-            time.sleep(2 ** attempt)
-            
-        except Exception as e:
-            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")    
-        except Exception as e:
-            print(f"Attempt {attempt + 1} failed: {str(e)}")
-            if attempt == retries - 1:
-                raise gr.Error(f"Unable to fetch rankings for {state if state else 'Australia'}.")
-            time.sleep(2 ** attempt)
 
-def process_suburb_input(suburb_text):
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt == retries - 1:
+                return []  # Return empty list on final failure
+            time.sleep(2 ** attempt)
+    
+    return suburbs 
+
+def process_suburb_input(suburb_text, max_price=None):
     """Process suburb input with dynamic API fetching"""
     state_mappings = {
         'NEW SOUTH WALES': 'NSW',
@@ -191,8 +186,8 @@ def process_suburb_input(suburb_text):
     
     if not suburb_text.strip():
         # Fetch top 10 nationwide when input is empty
-        return fetch_top_growth_suburbs(limit=10)
-    
+        return fetch_top_growth_suburbs(limit=5, max_price=max_price) or []
+
     input_text = suburb_text.upper().strip()
     input_lines = [line.strip() for line in input_text.splitlines() if line.strip()]
     
@@ -212,9 +207,9 @@ def process_suburb_input(suburb_text):
         # Fetch top suburbs only for explicitly mentioned states
         selected_suburbs = []
         for state in state_matches:
-            state_suburbs = fetch_top_growth_suburbs(state=state, limit=5)
+            state_suburbs = fetch_top_growth_suburbs(state=state, limit=5, max_price=max_price) or []
             selected_suburbs.extend(state_suburbs)
-        return selected_suburbs
+        return selected_suburbs or input_lines
     
     # Return exact suburbs provided without fetching additional ones
     return input_lines
@@ -295,7 +290,7 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                             },
                             {
                                 "role": "user",
-                                "content": f"Return the current housing inventory in {suburb} as a single number only. No additional text. " +
+                                "content": f"Return the current housing inventory in {suburb} in Australia as a single number only. No additional text. " +
                                         "If the data is unavailable, return market average of 6."
                             }
                         ],
@@ -541,6 +536,112 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                 raise gr.Error("Failed to process suburb data after 3 attempts. Please try again.")
             time.sleep(2 ** attempt)  # Exponential backoff
 
+def generate_default_growth_rates(num_years):
+    """Generate cyclical growth rates with 10-year market cycles"""
+    # Long-term base rate of 3.5%
+    base_rate = 0.035
+    
+    # Create array for all years
+    rates = np.zeros(num_years)
+    
+    # Generate 10-year cycles
+    for year in range(num_years):
+        cycle_position = year % 10  # Position in current 10-year cycle
+        
+        # Cycle adjustments with more extreme variations:
+        # Years 1-3: Strong boom phase
+        # Years 4-6: Moderate growth
+        # Years 7-8: Slowdown
+        # Years 9-10: Sharp correction
+        if cycle_position < 3:
+            # Boom phase: base_rate + 4-6%
+            cycle_adjustment = np.random.uniform(0.04, 0.06)
+        elif cycle_position < 6:
+            # Moderate growth: base_rate + 1-2%
+            cycle_adjustment = np.random.uniform(0.01, 0.02)
+        elif cycle_position < 8:
+            # Slowdown: base_rate - 1-3%
+            cycle_adjustment = np.random.uniform(-0.03, -0.01)
+        else:
+            # Sharp correction: base_rate - 3-5%
+            cycle_adjustment = np.random.uniform(-0.05, -0.03)
+            
+        # Add more pronounced random noise
+        noise = np.random.normal(0, 0.008)
+        
+        # Combine base rate, cycle adjustment and noise
+        rates[year] = base_rate + cycle_adjustment + noise
+    
+    # Wider bounds for more extreme cycles (0% to 12%)
+    rates = np.clip(rates, 0.0, 0.12)
+    
+    # Adjust to maintain long-term average close to base_rate
+    average_adjustment = base_rate - np.mean(rates)
+    rates += average_adjustment
+    
+    return rates * 100  # Convert to percentage
+
+def fetch_abs_historical_growth(suburb):
+    """Fetch historical housing growth data from ABS for the past 50 years"""
+    current_year = datetime.now().year
+    start_year = current_year - 50
+    
+    payload = {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an ABS data specialist. Return only numerical year-on-year Australian housing growth rates from ABS housing data."
+            },
+            {
+                "role": "user",
+                "content": f"""Return a JSON array of year-on-year housing price growth rates for {suburb} 
+                              from {start_year} to {current_year} using ABS data from the domain abs.gov.au only. 
+                              Format: [growth_rate1, growth_rate2, ...] 
+                              Include exactly {current_year - start_year} values."""
+            }
+        ],
+        "temperature": 0.0,
+        # "search_domain_filter": "abs.gov.au" # Retricted perplexity function. Requires Tier 3 usage.
+    }
+
+    try:
+        response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS)
+        
+        # Log the response for debugging
+        logging.debug(f"API Response for {suburb}: Status {response.status_code}")
+        logging.debug(f"Response content: {response.text}")
+        
+        # Handle different response status codes
+        if response.status_code == 400:
+            logging.warning(f"Bad request for {suburb} - using default growth rates")
+            return generate_default_growth_rates(current_year - start_year)
+            
+        response.raise_for_status()
+        
+        content = response.json()['choices'][0]['message']['content']
+        
+        # Strip Chain of Thought reasoning if present
+        if '<think>' in content:
+            content = content.split('```json')[1].split('```')[0]
+
+        # Find JSON array bounds
+        json_start = content.find('[')
+        json_end = content.rfind(']') + 1
+        
+        # Extract and parse JSON array
+        growth_rates = json.loads(content[json_start:json_end])
+        
+        # Validate growth rates
+        if len(growth_rates) != current_year - start_year:
+            logging.warning(f"Invalid number of growth rates for {suburb} - using default rates")
+            return generate_default_growth_rates(current_year - start_year)
+            
+        return np.array(growth_rates)
+
+    except Exception as e:
+        logging.error(f"Error fetching historical growth for {suburb}: {str(e)}")
+        return generate_default_growth_rates(current_year - start_year)
 
 def calculate_location_premium(distance_km, public_transport_score):
     """
@@ -927,7 +1028,7 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
     
     # Generate year range for projections
     current_year = datetime.now().year
-    years = np.arange(current_year, current_year + 51)  # +51 to include the end year
+    years = np.arange(current_year, current_year + 50)
 
     # For each suburb, add price projections
     for suburb, suburb_info in data_dict['suburbs'].items():
@@ -998,6 +1099,20 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         inflation_adj_lower_std = inflation_adj_median - np.std(inflation_adjusted_projections, axis=0)
         inflation_adj_upper_std = inflation_adj_median + np.std(inflation_adjusted_projections, axis=0)
 
+        # Get historical ABS growth rates
+        historical_rates = fetch_abs_historical_growth(suburb)
+        historical_prices = base_price * np.cumprod(1 + historical_rates/100)
+        
+        # Verify dimensions match before plotting
+        if len(historical_prices) < len(years):
+            # Pad historical prices to match years if needed
+            historical_prices = np.pad(historical_prices, 
+                                    (0, len(years) - len(historical_prices)),
+                                    'edge')
+        elif len(historical_prices) > len(years):
+            # Trim historical prices if too long
+            historical_prices = historical_prices[:len(years)]
+
         # Generate visualization
         plt.figure(figsize=(12, 7))
         
@@ -1011,6 +1126,14 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         plt.fill_between(years, inflation_adj_lower_std, inflation_adj_upper_std, alpha=0.2, color='#2ecc71', label='Inflation-Adjusted 68% CI')
         plt.plot(years, inflation_adj_median, label='Inflation-Adjusted Median', color='#2ecc71', linewidth=2)
         
+        # Add historical line to plot
+        plt.plot(years, historical_prices, 
+                label='Historical Growth Pattern', 
+                color='#e74c3c',
+                linestyle='--',
+                linewidth=1.5,
+                alpha=0.8)
+
         # Add price annotations at 5-year intervals
         interval_years = years[::5]
         nominal_prices = nominal_median[::5]
