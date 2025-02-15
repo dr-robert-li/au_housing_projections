@@ -299,7 +299,13 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                     inventory_response.raise_for_status()
                     inventory_content = inventory_response.json()['choices'][0]['message']['content']
                     inventory_months = float(inventory_content)
-                    supply_ratio = inventory_months / 6  # Normalize against 6-month benchmark
+
+                    supply_ratio = np.where(
+                        inventory_months < 1.5,
+                        0.25 + (inventory_months/6),  # Hyper-supply constraint premium
+                        inventory_months/6  # normalized standard ratio for normal conditions
+                    )  
+                    
                     log_api_response(suburb, inventory_payload, inventory_response)
 
                     # Then get specific or default data
@@ -414,7 +420,7 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                    
                     # Add supply ratio and inflation data
                     suburb_data["supply_ratio"] = {
-                        "value": supply_ratio,
+                        "value": float(supply_ratio),
                         "benchmark": 6,
                         "unit": "ratio"
                     }
@@ -434,6 +440,14 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                     }
                     
                     all_data["suburbs"][suburb] = suburb_data
+                    
+                    # # Print debugging information for data types
+                    # print(f"\nDebugging {suburb} data structure:")
+                    # for key, value in suburb_data.items():
+                    #     print(f"{key}: {type(value)}")
+                    #     if isinstance(value, dict):
+                    #         for sub_key, sub_value in value.items():
+                    #             print(f"  {sub_key}: {type(sub_value)}")
                     
                     # Create DataFrame for forecasting with all metrics
                     df = pd.DataFrame([{
@@ -498,15 +512,28 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
             if not dataframes:
                 raise ValueError("No valid suburb data collected")
             
+            # Convert any numpy values to native Python types in all_data
+            for suburb, data in all_data['suburbs'].items():
+                for key, value in data.items():
+                    if isinstance(value, np.ndarray):
+                        data[key] = value.tolist()
+                    elif isinstance(value, np.generic):
+                        data[key] = value.item()
+                    elif isinstance(value, dict):
+                        for sub_key, sub_value in value.items():
+                            if isinstance(sub_value, np.ndarray):
+                                value[sub_key] = sub_value.tolist()
+                            elif isinstance(sub_value, np.generic):
+                                value[sub_key] = sub_value.item()
+            
             return pd.concat(dataframes, ignore_index=True), json.dumps(all_data, indent=4)
         
         except Exception as e:
             logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt == 2:  # Last attempt
                 raise gr.Error("Failed to process suburb data after 3 attempts. Please try again.")
-            print(f"Attempt {attempt + 1} failed: {str(e)}")
             time.sleep(2 ** attempt)  # Exponential backoff
-            continue
+
 
 def calculate_location_premium(distance_km, public_transport_score):
     """
@@ -575,8 +602,8 @@ def calculate_park_premium(distance_km, quality_score):
 
 def calculate_risk_adjustments(flood_risk_score, climate_risk_score):
     """Calculate risk-based price adjustments"""
-    flood_discount = np.where(flood_risk_score > 5, -0.22, 0)
-    climate_discount = np.where(climate_risk_score > 7, -0.15, 0)
+    flood_discount = np.where(flood_risk_score > 5, -0.22, 0)  # 22% discount for high flood risk
+    climate_discount = np.where(climate_risk_score > 7, -0.15, 0)  # 15% for severe climate risk
     return flood_discount + climate_discount
 
 def calculate_view_premium(has_protection, height_limit):
@@ -592,7 +619,7 @@ def calculate_view_premium(has_protection, height_limit):
 
 def calculate_demographic_premium(row):
     """Calculate premium based on demographic factors"""
-    # Age-based adjustments
+    # Age-based adjustments with migration consideration
     youth_premium = 0.002 * (row['population_under_35'] / 100)
     aging_impact = -0.001 * (row['population_over_65'] / 100)
     
@@ -616,6 +643,44 @@ def calculate_demographic_premium(row):
     
     return (youth_premium + aging_impact + family_premium + 
             income_premium + size_premium)
+
+def calculate_crime_impact(row):
+    """
+    Calculate crime impact on property values with regional differentiation
+    and security mitigation factors
+    """
+    # Violent crime penalties with regional context
+    violent_crime_penalty = np.where(
+        row['assault_rate'] > 5,
+        -0.0003 * np.log(row['assault_rate']),
+        0
+    )
+    
+    # Property crime penalties adjusted for location type
+    property_crime_penalty = np.where(
+        row['breakin_rate'] > 20,
+        -0.00015 * (row['breakin_rate'] - 20),
+        0
+    )
+    
+    # Security adoption impact with thresholds
+    security_mitigation = 0.0002 * row['security_score']
+    
+    # Gentrification boost for high-growth areas
+    # Using absolute income threshold instead of median comparison
+    gentrification_boost = np.where(
+        (row['population_growth'] > 2.5) &
+        (row['household_income'] > 2000),  # Weekly household income threshold
+        0.0005,
+        0
+    )
+    
+    return (
+        violent_crime_penalty + 
+        property_crime_penalty + 
+        security_mitigation + 
+        gentrification_boost
+    )
 
 def fine_tune_model(model, new_data):
     """Incremental training with new suburb data including supply metrics"""
@@ -775,33 +840,7 @@ def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
     max_sustainable_growth = income_ceiling / suburb_data['median_price']
 
     # Crime impact calculations
-    violent_crime_penalty = np.where(
-        suburb_data['assault_rate'] > 5,
-        -0.0003 * np.log(suburb_data['assault_rate']),
-        0
-    )
-    
-    property_crime_penalty = np.where(
-        suburb_data['breakin_rate'] > 20,
-        -0.00015 * (suburb_data['breakin_rate'] - 20),
-        0
-    )
-    
-    security_mitigation = 0.0002 * suburb_data['security_score']
-    
-    gentrification_boost = np.where(
-        (suburb_data['population_growth'] > 2.5) &
-        (suburb_data['household_income'] > suburb_data['household_income'].median()),
-        0.0005,
-        0
-    )
-    
-    crime_impact = (
-        violent_crime_penalty + 
-        property_crime_penalty + 
-        security_mitigation + 
-        gentrification_boost
-    )
+    crime_impact = suburb_data.apply(calculate_crime_impact, axis=1)
 
     # Combine all adjustments
     base_growth = (
@@ -871,11 +910,27 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
             len(years)
         )
 
-        # Generate nominal price projections
+        # Generate nominal price projections with proper inflation handling
         for _ in range(n_simulations):
+            # Generate growth noise
             growth_noise = np.random.normal(0, 0.005, len(years))
-            growth_rates = base_growth_rate + growth_noise
-            projections = base_price * np.cumprod(1 + growth_rates)
+            base_rates = base_growth_rate + growth_noise
+            
+            # Generate inflation noise
+            inflation_noise = np.random.normal(0, inflation_volatility/100, len(years))
+            inflation_rates = forecast_inflation/100 + inflation_noise
+            
+            # Calculate real growth with partial inflation pass-through
+            # Housing typically maintains 3-4% real growth during inflation
+            real_growth = base_rates - (inflation_rates * 0.6)  # 60% inflation pass-through
+            
+            # Combined growth includes:
+            # 1. Real growth component (partially hedged against inflation)
+            # 2. Full inflation component
+            total_growth = real_growth + inflation_rates
+            
+            # Calculate price trajectory
+            projections = base_price * np.cumprod(1 + total_growth)
             all_projections.append(projections)
         
         # Convert to numpy array for calculations
