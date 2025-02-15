@@ -6,6 +6,7 @@ import csv
 import re
 import json
 import time
+from datetime import datetime
 import requests
 from typing import Optional
 import logging
@@ -213,7 +214,7 @@ def process_suburb_input(suburb_text):
 
 def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None, verbose: Optional[bool] = None):
     """
-    Fetch suburb data with property type specifications
+    Fetch suburb data with property type specifications and inflation metrics
     
     Parameters:
         suburbs (str): Newline-separated list of suburbs
@@ -237,29 +238,31 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
             
             for suburb in suburb_list:
                 try:
-                    # First get default averages
+                    # First get default averages and inflation metrics
                     default_payload = {
                         "model": "sonar-pro",
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "You are an expert Australian real estate analyst. Return average property metrics." +
-                                    "Only use data published in the last 12 months. " # bias recency
+                                "content": "You are an expert Australian real estate analyst and economist. Return average property metrics and inflation forecasts."
                             },
                             {
                                 "role": "user",
-                                "content": f"""Return average property metrics for {suburb}, Australia as JSON:
+                                "content": f"""Return metrics for {suburb}, Australia as JSON:
                                 {{
                                     "bedrooms": {{ "value": (average number), "range": "1-6" }},
                                     "bathrooms": {{ "value": (average number), "range": "1-4" }},
                                     "car_spaces": {{ "value": (average number), "range": "0-3" }},
-                                    "land_size": {{ "value": (average size), "unit": "sqm" }}
+                                    "land_size": {{ "value": (average size), "unit": "sqm" }},
+                                    "inflation": {{ 
+                                        "current": {{ "value": (rate), "unit": "percent" }},
+                                        "forecast": {{ "value": (rate), "unit": "percent" }},
+                                        "volatility": {{ "value": (rate), "unit": "percent" }}
+                                    }}
                                 }}"""
                             }
                         ],
-                        "temperature": 0.0,
-                        # "top_k": 4
-                        # "search_recency_filter": "month"
+                        "temperature": 0.0
                     }
                     
                     default_response = requests.post(PERPLEXITY_API_URL, json=default_payload, headers=HEADERS)
@@ -285,12 +288,11 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                             },
                             {
                                 "role": "user",
-                                "content": f"Return the current months of housing inventory in {suburb} as a single number only. No additional text."
+                                "content": f"Return the current housing inventory in {suburb} as a single number only. No additional text. " +
+                                        "If the data is unavailable, return market average of 6."
                             }
                         ],
-                        "temperature": 0.0,
-                        # "top_k": 2
-                        # "search_recency_filter": "month" # Too Granular
+                        "temperature": 0.0
                     }
 
                     inventory_response = requests.post(PERPLEXITY_API_URL, json=inventory_payload, headers=HEADERS)
@@ -302,6 +304,8 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
 
                     # Then get specific or default data
                     criteria = []
+                    if dwelling_type:
+                        criteria.append(f"type: {dwelling_type}")
                     if bedrooms:
                         criteria.append(f"with {bedrooms} bedrooms")
                     if bathrooms:
@@ -323,14 +327,14 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                             {
                                 "role": "system",
                                 "content": "You are an expert Australian real estate analyst. Return only a JSON object with numerical values and their units/ranges." +
-                                    "Only use data published in the last 12 months. " # bias recency
+                                    "Only use data published in the last 12 months. "
                             },
                             {
                                 "role": "user",
                                 "content": f"""Return a JSON object for {suburb}, Australia{criteria_str}, with:
                                 {{
                                     "median_price": {{ "value": (price), "unit": "AUD" }},
-                                    "dwelling_type": "{dwelling_type}",
+                                    "dwelling_type": "{dwelling_type if dwelling_type else 'house'}",
                                     "bedrooms": {{ "value": {bedrooms if bedrooms else "(number)"}, "range": "1-6" }},
                                     "bathrooms": {{ "value": {bathrooms if bathrooms else "(number)"}, "range": "1-4" }},
                                     "car_spaces": {{ "value": {car_spaces if car_spaces else "(number)"}, "range": "0-3" }},
@@ -364,8 +368,16 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                                     }},
                                     "flood_risk": {{ "value": (risk), "range": "1-10" }},
                                     "population_growth": {{ "value": (rate), "unit": "% per year" }},
+                                    "crime_stats": {{
+                                        "assault_rate": {{ "value": (per 1000 residents), "source": "ABS" }},
+                                        "breakin_rate": {{ "value": (per 1000 households), "source": "ABS" }},
+                                        "security_adoption": {{ 
+                                            "enhanced_security": {{ "value": (percentage), "source": "ABS" }},
+                                            "basic_security": {{ "value": (percentage), "source": "ABS" }}
+                                        }}
+                                    }},
                                     "climate_risk": {{ "value": (risk), "range": "1-10" }},
-                                    "public_transport": {{ "value": (score), "range": "1-10" }}.
+                                    "public_transport": {{ "value": (score), "range": "1-10" }},
                                     "demographics": {{
                                         "median_age": {{ "value": (age), "unit": "years" }},
                                         "household_size": {{ "value": (size), "unit": "persons" }},
@@ -384,9 +396,7 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                                 }}"""
                             }
                         ],
-                        "temperature": 0.0,
-                        # "top_k": 2
-                        # "search_recency_filter": "month"
+                        "temperature": 0.0
                     }
 
                     response = requests.post(PERPLEXITY_API_URL, json=suburb_payload, headers=HEADERS)
@@ -402,12 +412,14 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                     suburb_data = json.loads(content[json_start:json_end])
                     log_api_response(suburb, suburb_payload, response)
                    
-                    # Add supply ratio to suburb_data
+                    # Add supply ratio and inflation data
                     suburb_data["supply_ratio"] = {
                         "value": supply_ratio,
                         "benchmark": 6,
                         "unit": "ratio"
                     }
+                    
+                    suburb_data["inflation"] = default_data["inflation"]
                     
                     # Check if suburb price exceeds maximum price filter
                     if max_price and suburb_data['median_price']['value'] > max_price:
@@ -423,7 +435,7 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                     
                     all_data["suburbs"][suburb] = suburb_data
                     
-                    # Create DataFrame for forecasting
+                    # Create DataFrame for forecasting with all metrics
                     df = pd.DataFrame([{
                         'suburb': suburb,
                         'median_price': suburb_data['median_price']['value'],
@@ -443,31 +455,23 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                         'infrastructure_score': suburb_data['infrastructure_score']['value'],
                         'flood_risk': suburb_data['flood_risk']['value'],
                         'population_growth': suburb_data['population_growth']['value'],
+                        'assault_rate': suburb_data['crime_stats']['assault_rate']['value'],
+                        'breakin_rate': suburb_data['crime_stats']['breakin_rate']['value'],
+                        'enhanced_security': suburb_data['crime_stats']['security_adoption']['enhanced_security']['value'],
+                        'basic_security': suburb_data['crime_stats']['security_adoption']['basic_security']['value'],
+                        'security_score': (
+                            0.6 * suburb_data['crime_stats']['security_adoption']['enhanced_security']['value'] +
+                            0.4 * suburb_data['crime_stats']['security_adoption']['basic_security']['value']
+                        ),
                         'climate_risk': suburb_data['climate_risk']['value'],
                         'public_transport': suburb_data['public_transport']['value'],
                         'supply_ratio': suburb_data['supply_ratio']['value'],
                         'water_distance': suburb_data['water_features']['distance']['value'],
                         'water_type': suburb_data['water_features']['type'],
-                        'water_premium': calculate_water_premium(
-                            suburb_data['water_features']['distance']['value'],
-                            suburb_data['water_features']['type']
-                        ),
                         'park_distance': suburb_data['parks']['distance']['value'],
                         'park_quality': suburb_data['parks']['quality_score']['value'],
-                        'park_premium': calculate_park_premium(
-                            suburb_data['parks']['distance']['value'],
-                            suburb_data['parks']['quality_score']['value']
-                        ),
                         'view_protection': suburb_data['zoning']['view_protection']['value'],
                         'height_restriction': suburb_data['zoning']['height_restrictions']['value'],
-                        'view_premium': calculate_view_premium(
-                            suburb_data['zoning']['view_protection']['value'],
-                            suburb_data['zoning']['height_restrictions']['value']
-                        ),
-                        'risk_adjustment': calculate_risk_adjustments(
-                            suburb_data['flood_risk']['value'],
-                            suburb_data['climate_risk']['value']
-                        ),
                         'median_age': suburb_data['demographics']['median_age']['value'],
                         'household_size': suburb_data['demographics']['household_size']['value'],
                         'household_income': suburb_data['demographics']['household_income']['value'],
@@ -476,7 +480,10 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                         'single_parent': suburb_data['demographics']['family_composition']['single_parent']['value'],
                         'population_under_35': suburb_data['demographics']['age_distribution']['under_35']['value'],
                         'population_35_to_65': suburb_data['demographics']['age_distribution']['35_to_65']['value'],
-                        'population_over_65': suburb_data['demographics']['age_distribution']['over_65']['value']
+                        'population_over_65': suburb_data['demographics']['age_distribution']['over_65']['value'],
+                        'current_inflation': suburb_data['inflation']['current']['value'],
+                        'forecast_inflation': suburb_data['inflation']['forecast']['value'],
+                        'inflation_volatility': suburb_data['inflation']['volatility']['value']
                     }])
                     dataframes.append(df)
 
@@ -670,6 +677,7 @@ def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
     4. Demographic Factors
     5. Risk Adjustments
     6. Affordability Constraints
+    7. Crime Statistics
     """
     # Supply impact with continuous scaling (AHURI Report 281)
     supply_impact = np.where(
@@ -766,6 +774,35 @@ def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
     income_ceiling = annual_income * 4.5  # APRA guideline multiplier
     max_sustainable_growth = income_ceiling / suburb_data['median_price']
 
+    # Crime impact calculations
+    violent_crime_penalty = np.where(
+        suburb_data['assault_rate'] > 5,
+        -0.0003 * np.log(suburb_data['assault_rate']),
+        0
+    )
+    
+    property_crime_penalty = np.where(
+        suburb_data['breakin_rate'] > 20,
+        -0.00015 * (suburb_data['breakin_rate'] - 20),
+        0
+    )
+    
+    security_mitigation = 0.0002 * suburb_data['security_score']
+    
+    gentrification_boost = np.where(
+        (suburb_data['population_growth'] > 2.5) &
+        (suburb_data['household_income'] > suburb_data['household_income'].median()),
+        0.0005,
+        0
+    )
+    
+    crime_impact = (
+        violent_crime_penalty + 
+        property_crime_penalty + 
+        security_mitigation + 
+        gentrification_boost
+    )
+
     # Combine all adjustments
     base_growth = (
         pop_growth_adj +
@@ -779,6 +816,7 @@ def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
         dwelling_adj +
         demographic_adj +
         household_size_adj +
+        crime_impact +
         supply_impact
     )
 
@@ -807,13 +845,16 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
     # Calculate base growth rate adjustments from suburb metrics
     growth_adjustments = calculate_growth_adjustments(suburb_data)
     
-    # Generate year range
-    years = np.arange(2025, 2076)
-    
+    # Generate year range for projections
+    current_year = datetime.now().year
+    years = np.arange(current_year, current_year + 51)  # +51 to include the end year
+
     # For each suburb, add price projections
     for suburb, suburb_info in data_dict['suburbs'].items():
-        # Get base price for this suburb
+        # Get base price and inflation metrics for this suburb
         base_price = suburb_info['median_price']['value']
+        forecast_inflation = suburb_info['inflation']['forecast']['value']
+        inflation_volatility = suburb_info['inflation']['volatility']['value']
         
         # Calculate suburb-specific growth rate
         suburb_idx = suburb_data[suburb_data['suburb'] == suburb].index[0]
@@ -822,206 +863,301 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         # Calculate projections using Monte Carlo with adjusted rates
         n_simulations = 1000
         all_projections = []
+        
+        # Create base growth rate trajectory
         base_growth_rate = np.linspace(
             max(0.015, adjusted_growth - 0.005),  # Floor at 1.5%
-            min(0.045, adjusted_growth + 0.01),    # Ceiling at 4.5%
+            min(0.045, adjusted_growth + 0.01),   # Ceiling at 4.5%
             len(years)
         )
 
+        # Generate nominal price projections
         for _ in range(n_simulations):
             growth_noise = np.random.normal(0, 0.005, len(years))
             growth_rates = base_growth_rate + growth_noise
             projections = base_price * np.cumprod(1 + growth_rates)
             all_projections.append(projections)
         
-        # Calculate statistics for each year
-        projections_array = np.array(all_projections)
-        median_projection = np.median(projections_array, axis=0)
-        lower_95 = np.percentile(projections_array, 2.5, axis=0)
-        upper_95 = np.percentile(projections_array, 97.5, axis=0)
-        lower_std = median_projection - np.std(projections_array, axis=0)
-        upper_std = median_projection + np.std(projections_array, axis=0)
+        # Convert to numpy array for calculations
+        nominal_projections = np.array(all_projections)
+        
+        # Calculate nominal statistics
+        nominal_median = np.median(nominal_projections, axis=0)
+        nominal_lower_95 = np.percentile(nominal_projections, 2.5, axis=0)
+        nominal_upper_95 = np.percentile(nominal_projections, 97.5, axis=0)
+        nominal_lower_std = nominal_median - np.std(nominal_projections, axis=0)
+        nominal_upper_std = nominal_median + np.std(nominal_projections, axis=0)
 
-        # Add projections to suburb data
-        suburb_info['price_projections'] = {
-            'years': years.tolist(),
-            'median_projection': median_projection.tolist(),
-            'confidence_intervals': {
-                'lower_95': lower_95.tolist(),
-                'upper_95': upper_95.tolist(),
-                'lower_std': lower_std.tolist(),
-                'upper_std': upper_std.tolist()
-            },
-            'growth_assumptions': {
-                'base_rate_range': [float(base_growth_rate[0]), float(base_growth_rate[-1])],
-                'volatility': 0.0055, # Average of Regional and Suburban Volatility
-                'growth_adjustment': float(adjusted_growth)
-            }
-        }
+        # Calculate inflation factors for price adjustments
+        inflation_noise = np.random.normal(0, inflation_volatility/100, (n_simulations, len(years)))
+        inflation_factors = np.cumprod(1 + (forecast_inflation/100 + inflation_noise), axis=1)
+        
+        # Calculate inflation-adjusted projections
+        inflation_adjusted_projections = nominal_projections * inflation_factors
+        
+        # Calculate inflation-adjusted statistics
+        inflation_adj_median = np.median(inflation_adjusted_projections, axis=0)
+        inflation_adj_lower_95 = np.percentile(inflation_adjusted_projections, 2.5, axis=0)
+        inflation_adj_upper_95 = np.percentile(inflation_adjusted_projections, 97.5, axis=0)
+        inflation_adj_lower_std = inflation_adj_median - np.std(inflation_adjusted_projections, axis=0)
+        inflation_adj_upper_std = inflation_adj_median + np.std(inflation_adjusted_projections, axis=0)
 
-        # Generate and save plot
+        # Generate visualization
         plt.figure(figsize=(12, 7))
-        plt.fill_between(years, lower_95, upper_95, alpha=0.1, color='#2ecc71', label='95% Confidence Interval')
-        plt.fill_between(years, lower_std, upper_std, alpha=0.2, color='#2ecc71', label='68% Confidence Interval')
-        plt.plot(years, median_projection, label='Median Projection', color='#2ecc71', linewidth=2)
+        
+        # Plot nominal projections (blue)
+        plt.fill_between(years, nominal_lower_95, nominal_upper_95, alpha=0.1, color='#3498db', label='Nominal 95% CI')
+        plt.fill_between(years, nominal_lower_std, nominal_upper_std, alpha=0.2, color='#3498db', label='Nominal 68% CI')
+        plt.plot(years, nominal_median, label='Nominal Median', color='#3498db', linewidth=2)
+        
+        # Plot inflation-adjusted projections (green)
+        plt.fill_between(years, inflation_adj_lower_95, inflation_adj_upper_95, alpha=0.1, color='#2ecc71', label='Inflation-Adjusted 95% CI')
+        plt.fill_between(years, inflation_adj_lower_std, inflation_adj_upper_std, alpha=0.2, color='#2ecc71', label='Inflation-Adjusted 68% CI')
+        plt.plot(years, inflation_adj_median, label='Inflation-Adjusted Median', color='#2ecc71', linewidth=2)
         
         # Add price annotations at 5-year intervals
-        interval_years = years[::5]  # Select every 5th year
-        interval_prices = median_projection[::5]  # Get corresponding prices
-
-        for year, price in zip(interval_years, interval_prices):
+        interval_years = years[::5]
+        nominal_prices = nominal_median[::5]
+        inflation_adj_prices = inflation_adj_median[::5]
+        
+        for year, nom_price, infl_price in zip(interval_years, nominal_prices, inflation_adj_prices):
+            # Nominal price annotation - now always below the line
             plt.annotate(
-                f'${price:,.0f}',
-                xy=(year, price),
-                xytext=(0, 10),
+                f'${nom_price:,.0f}',
+                xy=(year, nom_price),
+                xytext=(0, -20),  
                 textcoords='offset points',
                 ha='center',
-                va='bottom',
-                bbox=dict(
-                    boxstyle='round,pad=0.5',
-                    fc='white',
-                    ec='gray',
-                    alpha=0.7
-                )
+                va='top',  
+                bbox=dict(boxstyle='round,pad=0.5', fc='white', ec='gray', alpha=0.7)
+            )
+            # Inflation-adjusted price annotation remains above
+            plt.annotate(
+                f'${infl_price:,.0f}',
+                xy=(year, infl_price),
+                xytext=(0, 10), 
+                textcoords='offset points',
+                ha='center',
+                va='bottom', 
+                bbox=dict(boxstyle='round,pad=0.5', fc='white', ec='gray', alpha=0.7)
             )
 
-        plt.title(f"50-Year Housing Price Forecast for {suburb}", fontsize=14)
+        # Configure plot styling
+        plt.title(f"50-Year Housing Price Forecast for {suburb}\nNominal vs Inflation-Adjusted Values", fontsize=14)
         plt.xlabel("Year", fontsize=12)
-        plt.ylabel("Median Price (AUD)", fontsize=12)
+        plt.ylabel("Price (AUD)", fontsize=12)
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
         
+        # Save plot and store path
         plot_path = FORECAST_DIR / f"{suburb.replace(' ', '_')}_forecast.png"
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         plot_paths.append(plot_path)
+        
+        # Add projections to suburb data
+        suburb_info['price_projections'] = {
+            'years': years.tolist(),
+            'nominal': {
+                'median_projection': nominal_median.tolist(),
+                'confidence_intervals': {
+                    'lower_95': nominal_lower_95.tolist(),
+                    'upper_95': nominal_upper_95.tolist(),
+                    'lower_std': nominal_lower_std.tolist(),
+                    'upper_std': nominal_upper_std.tolist()
+                }
+            },
+            'inflation_adjusted': {
+                'median_projection': inflation_adj_median.tolist(),
+                'confidence_intervals': {
+                    'lower_95': inflation_adj_lower_95.tolist(),
+                    'upper_95': inflation_adj_upper_95.tolist(),
+                    'lower_std': inflation_adj_lower_std.tolist(),
+                    'upper_std': inflation_adj_upper_std.tolist()
+                }
+            },
+            'growth_assumptions': {
+                'base_rate_range': [float(base_growth_rate[0]), float(base_growth_rate[-1])],
+                'volatility': 0.0055,
+                'growth_adjustment': float(adjusted_growth),
+                'inflation': {
+                    'forecast_rate': float(forecast_inflation),
+                    'volatility': float(inflation_volatility)
+                }
+            }
+        }
     
     return plot_paths, json.dumps(data_dict, indent=4)
 
-def generate_forecast_reasoning(api_data: dict, verbose: bool = False) -> tuple[str, list[str]]:
-    """Generate detailed reasoning for price forecasts with citations"""
+def generate_forecast_reasoning(df: pd.DataFrame, api_data: str, verbose: bool = False) -> tuple[str, list[str]]:
+    """Generate detailed reasoning for price forecasts using DataFrame data and price projections"""
     all_reasoning = []
     all_citations = []
     
-    for suburb, data in api_data['suburbs'].items():
-        # Construct reasoning request with comprehensive analysis points
+    data_dict = json.loads(api_data)
+    
+    for _, row in df.iterrows():
+        suburb = row['suburb']
+        projections = data_dict['suburbs'][suburb]['price_projections']
+        
+        years = projections['years']
+        year_indices = [
+            next(i for i, y in enumerate(years) if y-years[0] >= 5),
+            next(i for i, y in enumerate(years) if y-years[0] >= 25),
+            -1  # Last index (50 years)
+        ]
+        
+        nominal_prices = [
+            projections['nominal']['median_projection'][i] 
+            for i in year_indices
+        ]
+        inflation_adj_prices = [
+            projections['inflation_adjusted']['median_projection'][i] 
+            for i in year_indices
+        ]
+        
         reasoning_payload = {
             "model": "sonar-reasoning-pro",
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are an expert Australian real estate analyst. Analyze property market data and provide detailed growth reasoning with citations. Format: <think>analysis</think> followed by citations: [urls]"
+                    "content": "You are an expert Australian real estate analyst. Focus analysis on 25-year timeframe as primary, with 50-year projections as supplementary long-term indicators. Provide detailed growth reasoning with citations. Format: <think>analysis</think> followed by citations: [urls]"
                 },
                 {
                     "role": "user",
-                    "content": f"""Analyze 50-year price projections for {suburb} {data['dwelling_type']} properties considering:
-
-                    Property Characteristics:
-                    - Current median price: ${data['median_price']['value']:,.2f}
-                    - Property type: {data['dwelling_type']}
-                    - Configuration: {data['bedrooms']['value']} bed, {data['bathrooms']['value']} bath
-                    - Land size: {data['land_size']['value']} sqm
+                    "content": f"""Analyze price projections for {suburb} {row['dwelling_type']} properties with emphasis on 25-year outlook:
                     
-                    Location & Infrastructure:
-                    - Distance to CBD: {data['distance_to_cbd']['value']}km
-                    - Public transport score: {data['public_transport']['value']}/10
-                    - Infrastructure score: {data['infrastructure_score']['value']}/10
-                    - School quality: {data['school_quality']['value']}/10
+                    Primary Growth Outlook (25-Year Forecast):
+                    - Nominal: ${nominal_prices[1]:,.2f}
+                    - Inflation-Adjusted: ${inflation_adj_prices[1]:,.2f}
+                    - Confidence Level: High
                     
-                    Market Conditions:
-                    - Supply ratio: {data['supply_ratio']['value']:.2f}
-                    - Population growth: {data['population_growth']['value']}%
+                    Supporting Projections:
+                    5-Year Forecast (Near-Term):
+                    - Nominal: ${nominal_prices[0]:,.2f}
+                    - Inflation-Adjusted: ${inflation_adj_prices[0]:,.2f}
+                    - Confidence Level: Very High
                     
-                    Risk Factors:
-                    - Flood risk: {data['flood_risk']['value']}/10
-                    - Climate risk: {data['climate_risk']['value']}/10
-                    
-                    Demographics:
-                    - Median age: {data['demographics']['median_age']['value']} years
-                    - Household income: ${data['demographics']['household_income']['value']}/week
-                    - Family composition: {data['demographics']['family_composition']}
+                    Extended Outlook (50-Year):
+                    - Nominal: ${nominal_prices[2]:,.2f}
+                    - Inflation-Adjusted: ${inflation_adj_prices[2]:,.2f}
+                    - Confidence Level: Moderate
                     
                     Growth Assumptions:
-                    {data['price_projections']['growth_assumptions']}
+                    - Base Growth Rate: {projections['growth_assumptions']['base_rate_range'][0]:.3f} to {projections['growth_assumptions']['base_rate_range'][1]:.3f}
+                    - Growth Volatility: {projections['growth_assumptions']['volatility']:.4f}
+                    - Growth Adjustment: {projections['growth_assumptions']['growth_adjustment']:.4f}
+
+                    Property Characteristics:
+                    - Current median price: ${row['median_price']:,.2f}
+                    - Property type: {row['dwelling_type']}
+                    - Configuration: {row['bedrooms']} bed, {row['bathrooms']} bath
+                    - Land size: {row['land_size']} sqm
+                    
+                    Location & Infrastructure:
+                    - Distance to CBD: {row['distance_to_cbd']}km
+                    - Public transport score: {row['public_transport']}/10
+                    - Infrastructure score: {row['infrastructure_score']}/10
+                    - School quality: {row['school_quality']}/10
+                    
+                    Commercial Centers:
+                    - Major centers: {row['major_commercial_count']} within {row['major_commercial_distance']}km
+                    - Major center quality: {row['major_center_size_score']}/10
+                    - Local centers: {row['local_commercial_count']} within {row['local_commercial_distance']}km
+                    - Retail quality: {row['retail_quality_score']}/10
+                    
+                    Natural Features:
+                    - Water proximity: {row['water_distance']}km to {row['water_type']}
+                    - Park quality: {row['park_quality']}/10 at {row['park_distance']}km
+                    - View protection: {row['view_protection']} with {row['height_restriction']}m limit
+                    
+                    Market Conditions:
+                    - Supply ratio: {row['supply_ratio']:.2f}
+                    - Population growth: {row['population_growth']}%
+                    - Current inflation: {row['current_inflation']}%
+                    - Forecast inflation: {row['forecast_inflation']}%
+                    - Inflation volatility: {row['inflation_volatility']}%
+                    
+                    Risk Factors:
+                    - Flood risk: {row['flood_risk']}/10
+                    - Climate risk: {row['climate_risk']}/10
+                    
+                    Crime Statistics:
+                    - Assault rate: {row['assault_rate']} per 1000 residents
+                    - Break-in rate: {row['breakin_rate']} per 1000 households
+                    - Enhanced security: {row['enhanced_security']}%
+                    - Basic security: {row['basic_security']}%
+                    - Security score: {row['security_score']:.1f}
+                    
+                    Demographics:
+                    - Median age: {row['median_age']} years
+                    - Household size: {row['household_size']} persons
+                    - Weekly household income: ${row['household_income']:,.2f}
+                    - Couples with children: {row['couples_with_children']}%
+                    - Couples no children: {row['couples_no_children']}%
+                    - Single parent: {row['single_parent']}%
+                    - Under 35: {row['population_under_35']}%
+                    - 35-65: {row['population_35_to_65']}%
+                    - Over 65: {row['population_over_65']}%
                     
                     Provide comprehensive analysis covering:
-                    1. Key growth drivers and market fundamentals
-                    2. Supply-demand dynamics
-                    3. Infrastructure and location impact
-                    4. Demographic trends and implications
-                    5. Risk assessment and mitigation factors
-                    6. Long-term growth sustainability
+                    1. Primary 25-year growth trajectory and key drivers
+                    2. Near-term (5-year) market dynamics and opportunities
+                    3. Long-term (50-year) trend indicators and sustainability
+                    4. Supply-demand dynamics
+                    5. Infrastructure and location impact
+                    6. Demographic trends and implications
+                    7. Risk assessment and mitigation factors
+                    8. Crime impact and security considerations
+                    9. Inflation effects on nominal vs adjusted values
                     Include relevant citations to research and market data.
                     """
                 }
             ],
-            #"max_tokens": 123,
-            "temperature": 0.2,
-            #"top_p": 0.9,
-            #"search_domain_filter": None,
-            #"return_images": False,
-            #"return_related_questions": False,
-            #"search_recency_filter": "month",
-            #"top_k": 0,
-            #"stream": False,
-            #"presence_penalty": 0,
-            #"frequency_penalty": 1,
-            #"response_format": None
+            "temperature": 0.2
         }
         
         try:
-            # Log API request details if verbose
+            response = requests.post(PERPLEXITY_API_URL, json=reasoning_payload, headers=HEADERS)
+            response.raise_for_status()
+
             if verbose:
                 logging.debug(f"\n=== Reasoning API Call for {suburb} ===")
                 logging.debug(f"Request Payload:\n{json.dumps(reasoning_payload, indent=2)}")
-            
-            response = requests.post(PERPLEXITY_API_URL, json=reasoning_payload, headers=HEADERS)
-            response.raise_for_status()
-            
-            # Log API response if verbose
-            if verbose:
                 logging.debug(f"Response Status: {response.status_code}")
                 logging.debug(f"Response Content:\n{response.text}\n")
             
-            content = response.json()['choices'][0]['message']['content']
+            response_data = response.json()
+            content = response_data['choices'][0]['message']['content']
+            citations = response_data.get('citations', [])
             
-            # Extract reasoning between think tags
             reasoning_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
-            if reasoning_match:
-                reasoning = reasoning_match.group(1).strip()
-            else:
-                # Fallback to full content if tags not found
-                reasoning = content.strip()
+            reasoning = reasoning_match.group(1).strip() if reasoning_match else content.strip()
             
-            # Extract citations array
-            citations_match = re.search(r'citations:\s*(\[.*?\])', content, re.DOTALL)
-            citations = json.loads(citations_match.group(1)) if citations_match else []
-            
-            # Format suburb analysis with clear sections
             suburb_analysis = f"""
-            {'='*80}
-            Detailed Market Analysis for {suburb} ({data['dwelling_type'].title()} Properties)
-            {'='*80}
-            
-            {reasoning}
-            
-            Research Sources:
-            {chr(10).join(f'- {cite}' for cite in citations)}
-            
-            {'='*80}
-            """
+## Market Analysis: {suburb} ({row['dwelling_type'].title()} Properties)
+
+{reasoning}
+
+### Research Sources
+{chr(10).join(f'- {cite}' for cite in citations)}
+
+---
+"""
             
             all_reasoning.append(suburb_analysis)
             all_citations.extend(citations)
             
-            if verbose:
-                logging.debug(f"Successfully generated reasoning for {suburb}")
-                
         except Exception as e:
             error_msg = f"Error generating reasoning for {suburb}: {str(e)}"
             logging.error(error_msg)
-            all_reasoning.append(f"\nError: {error_msg}\n")
+            all_reasoning.append(f"""
+## Error: {suburb}
+{error_msg}
+
+---
+""")
             continue
     
     return "\n".join(all_reasoning), list(set(all_citations))
@@ -1055,6 +1191,14 @@ def save_forecast_data(api_data, format='json'):
                 f.write(f"Bathrooms: {data['bathrooms']['value']}\n")
                 f.write(f"Car Spaces: {data['car_spaces']['value']}\n")
                 f.write(f"Land Size: {data['land_size']['value']} sqm\n\n")
+                
+                # Crime Statistics
+                f.write("Crime Statistics:\n")
+                f.write(f"Assault Rate: {data['crime_stats']['assault_rate']['value']} per 1000 residents\n")
+                f.write(f"Break-in Rate: {data['crime_stats']['breakin_rate']['value']} per 1000 households\n")
+                f.write("Security Adoption:\n")
+                f.write(f"  Enhanced Security: {data['crime_stats']['security_adoption']['enhanced_security']['value']}%\n")
+                f.write(f"  Basic Security: {data['crime_stats']['security_adoption']['basic_security']['value']}%\n\n")
                 
                 # Demographics
                 f.write("Demographics:\n")
@@ -1121,7 +1265,10 @@ def save_forecast_data(api_data, format='json'):
                 
                 # Market Conditions
                 f.write("Market Conditions:\n")
-                f.write(f"Supply Ratio: {data['supply_ratio']['value']:.2f} (Benchmark: {data['supply_ratio']['benchmark']} months)\n\n")
+                f.write(f"Supply Ratio: {data['supply_ratio']['value']:.2f} (Benchmark: {data['supply_ratio']['benchmark']} months)\n")
+                f.write(f"Current Inflation: {data['inflation']['current']['value']}%\n")
+                f.write(f"Forecast Inflation: {data['inflation']['forecast']['value']}%\n")
+                f.write(f"Inflation Volatility: {data['inflation']['volatility']['value']}%\n\n")
                 f.write("-" * 80 + "\n\n")
     
     elif format == 'xlsx' or format == 'csv':
@@ -1157,6 +1304,11 @@ def save_forecast_data(api_data, format='json'):
             'Risk Adjustment',
             'Flood Risk (1-10)',
             'Climate Risk (1-10)',
+            'Assault Rate (per 1000)',
+            'Break-in Rate (per 1000)',
+            'Enhanced Security (%)',
+            'Basic Security (%)',
+            'Security Score',
             'Median Age (years)',
             'Household Size (persons)',
             'Weekly Household Income (AUD)',
@@ -1166,7 +1318,10 @@ def save_forecast_data(api_data, format='json'):
             'Population Under 35 (%)',
             'Population 35-65 (%)',
             'Population Over 65 (%)',
-            'Demographic Premium'
+            'Demographic Premium',
+            'Current Inflation (%)',
+            'Forecast Inflation (%)',
+            'Inflation Volatility (%)'
         ])
         
         for suburb, data in data_dict['suburbs'].items():
@@ -1214,6 +1369,14 @@ def save_forecast_data(api_data, format='json'):
                 ),
                 'Flood Risk (1-10)': data['flood_risk']['value'],
                 'Climate Risk (1-10)': data['climate_risk']['value'],
+                'Assault Rate (per 1000)': data['crime_stats']['assault_rate']['value'],
+                'Break-in Rate (per 1000)': data['crime_stats']['breakin_rate']['value'],
+                'Enhanced Security (%)': data['crime_stats']['security_adoption']['enhanced_security']['value'],
+                'Basic Security (%)': data['crime_stats']['security_adoption']['basic_security']['value'],
+                'Security Score': (
+                    0.6 * data['crime_stats']['security_adoption']['enhanced_security']['value'] +
+                    0.4 * data['crime_stats']['security_adoption']['basic_security']['value']
+                ),
                 'Median Age (years)': data['demographics']['median_age']['value'],
                 'Household Size (persons)': data['demographics']['household_size']['value'],
                 'Weekly Household Income (AUD)': data['demographics']['household_income']['value'],
@@ -1231,7 +1394,10 @@ def save_forecast_data(api_data, format='json'):
                     'household_income': data['demographics']['household_income']['value'],
                     'household_size': data['demographics']['household_size']['value'],
                     'dwelling_type': data['dwelling_type']
-                }))
+                })),
+                'Current Inflation (%)': data['inflation']['current']['value'],
+                'Forecast Inflation (%)': data['inflation']['forecast']['value'],
+                'Inflation Volatility (%)': data['inflation']['volatility']['value']
             }])], ignore_index=True)
         
         if format == 'xlsx':
@@ -1267,14 +1433,16 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
     gr.Markdown("""
         ## 🏡 Australian Suburb Housing Price Forecaster
         
-        This application uses machine learning and real estate market data to forecast 50-year housing prices for Australian suburbs, with confidence intervals and detailed analytics.
+        This application uses machine learning and real world hedonic real estate market data to forecast 50-year housing prices for Australian suburbs, with confidence intervals and detailed analytics.
         
         ### Input Options:
         - Empty Input → Analyzes top growth suburbs nationally
         - State Names Only (e.g., "NSW", "Victoria") → Top growth suburbs per state
         - Otherwise → Analyzes suburbs matching input
         - Property Criteria (0 = Any): Bedrooms, Bathrooms, Car Spaces, Land Size, Max Median Price
-        \n            
+        
+        #### NOTE: Include Detailed Reasoning uses Deep Reasoning and is both expensive and slow. Use with care.
+                           
         """)
         
     # Main content
@@ -1421,7 +1589,19 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
         processed_suburbs = process_suburb_input(suburbs)
         suburbs_text = '\n'.join(processed_suburbs)
         
-        plots, api_data = forecast_prices(
+        # First get suburb data
+        suburb_df, api_data = fetch_suburb_data(
+            suburbs_text,
+            dwelling_type,
+            process_input(bedrooms),
+            process_input(bathrooms),
+            process_input(car_spaces),
+            process_input(land_size),
+            process_input(max_price)
+        )
+        
+        # Then generate price forecasts
+        plots, forecast_data = forecast_prices(
             suburbs_text,
             dwelling_type,
             process_input(bedrooms),
@@ -1434,14 +1614,15 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
         # Generate reasoning only if requested
         reasoning_text = None
         if include_reasoning:
-            reasoning_text, _ = generate_forecast_reasoning(json.loads(api_data), verbose)
+            # Use the DataFrame and forecast data
+            reasoning_text, _ = generate_forecast_reasoning(suburb_df, forecast_data, verbose)
         
         # Get current logs
         logs = textbox_handler.get_logs()
         
         return [
             plots, 
-            api_data, 
+            forecast_data,  # Return forecast_data instead of api_data
             reasoning_text if reasoning_text else "Enable 'Include Detailed Reasoning' for analysis", 
             logs
         ]

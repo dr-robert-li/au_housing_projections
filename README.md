@@ -1,5 +1,5 @@
 # 🏡 Australian Suburb Housing Price Forecaster
-### Version 1.1
+### Version 1.2
 ### Author: Robert Li ([dr-robert-li](https://github.com/dr-robert-li/))
     
 This Machine Learning powered application uses finetuned XGBoost advanced regression model and a hedonic model of valuation to forecast housing prices for Australian suburbs over a 50-year period using machine learning and real estate market data.
@@ -24,15 +24,23 @@ This Machine Learning powered application uses finetuned XGBoost advanced regres
   - Townhouse: Connected row housing
 
 ### Advanced Analytics
-- 50-year price projections with confidence intervals
+- Price projections with confidence intervals:
+  - 5-year (Very High Confidence): Near-term market dynamics
+  - 25-year (High Confidence): Primary analysis timeframe
+  - 50-year (Moderate Confidence): Long-term trend indicators
 - Monte Carlo simulations for price modeling
 - Multiple confidence intervals (1 Std.d 68% and 2 Std.d 95%)
+- Nominal vs Inflation-Adjusted Values:
+  - Current inflation impact
+  - Forecast inflation rates
+  - Inflation volatility modeling
 - Key market indicators:
   - Dwelling type specific growth adjustments
   - School quality scores
   - Infrastructure ratings
   - Flood and climate risk assessments
   - Population growth trends
+  - Crime rates
   - Public transport accessibility
   - Distance to CBD based decay
   - Quality and distance of commercial centers
@@ -46,9 +54,21 @@ This Machine Learning powered application uses finetuned XGBoost advanced regres
     - Supply ratio benchmarking against 6-month standard
     - Dynamic growth adjustments based on supply conditions
 
-### Optional Deep Reasoning
+### Optional Deep Market Reasoning
+- Comprehensive market analysis for each suburb:
+  - Primary 25-year growth trajectory analysis
+  - Near-term (5-year) market opportunities
+  - Long-term (50-year) sustainability indicators
+  - Supply-demand dynamics
+  - Infrastructure impact assessment
+  - Demographic trend implications
+  - Risk assessment and mitigation strategies
+  - Crime impact and security considerations
+  - Inflation effects analysis
+- Research citations and market data sources
+- Exportable in RTF and TXT formats
 
-Detailed explanations for price forecasts based on Deep Reasoning model exportable in RTF and TXT formats.
+#### NOTE: This uses Deep Reasoning and Chain of Thought. It is both expensive and slow. Use with care especially for large datasets of multiple suburbs.
 
 ### Model Fine-tuning
 - Progressive learning with synthetic data generation
@@ -113,6 +133,7 @@ Melbourne CBD VIC
 - Supports incremental model training with new data
 
 ## Data Storage
+
 - Forecasts saved in ./forecasts directory
 - Exported data stored in ./exports directory
 - Timestamped files for version tracking
