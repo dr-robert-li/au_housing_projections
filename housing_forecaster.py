@@ -537,47 +537,40 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
             time.sleep(2 ** attempt)  # Exponential backoff
 
 def generate_default_growth_rates(num_years):
-    """Generate cyclical growth rates with 10-year market cycles"""
+    """Generate cyclical growth rates with 15-year market cycles using sine waves"""
     # Long-term base rate of 3.5%
     base_rate = 0.035
     
     # Create array for all years
     rates = np.zeros(num_years)
     
-    # Generate 10-year cycles
-    for year in range(num_years):
-        cycle_position = year % 10  # Position in current 10-year cycle
-        
-        # Cycle adjustments with more extreme variations:
-        # Years 1-3: Strong boom phase
-        # Years 4-6: Moderate growth
-        # Years 7-8: Slowdown
-        # Years 9-10: Sharp correction
-        if cycle_position < 3:
-            # Boom phase: base_rate + 4-6%
-            cycle_adjustment = np.random.uniform(0.04, 0.06)
-        elif cycle_position < 6:
-            # Moderate growth: base_rate + 1-2%
-            cycle_adjustment = np.random.uniform(0.01, 0.02)
-        elif cycle_position < 8:
-            # Slowdown: base_rate - 1-3%
-            cycle_adjustment = np.random.uniform(-0.03, -0.01)
-        else:
-            # Sharp correction: base_rate - 3-5%
-            cycle_adjustment = np.random.uniform(-0.05, -0.03)
-            
-        # Add more pronounced random noise
-        noise = np.random.normal(0, 0.008)
-        
-        # Combine base rate, cycle adjustment and noise
-        rates[year] = base_rate + cycle_adjustment + noise
+    # Generate sine wave with 15-year period
+    # 2π/15 gives us exactly one cycle every 15 years
+    cycle_positions = np.arange(num_years)
+    sine_wave = np.sin(2 * np.pi * cycle_positions / 15)
     
-    # Wider bounds for more extreme cycles (0% to 12%)
-    rates = np.clip(rates, 0.0, 0.12)
+    # Scale sine wave to desired amplitude range (3-11%)
+    # Sine wave ranges from -1 to 1, so we scale and shift to get 3-11%
+    min_rate = 0.03  # 3%
+    max_rate = 0.11  # 11%
+    amplitude = (max_rate - min_rate) / 2
+    mean_rate = (max_rate + min_rate) / 2
+    
+    rates = mean_rate + (amplitude * sine_wave)
+    
+    # Add controlled random noise (small variations within bounds)
+    noise = np.random.normal(0, 0.005, num_years)  # Small noise factor
+    rates += noise
+    
+    # Ensure rates stay within 3-11% bounds
+    rates = np.clip(rates, min_rate, max_rate)
     
     # Adjust to maintain long-term average close to base_rate
     average_adjustment = base_rate - np.mean(rates)
     rates += average_adjustment
+    
+    # Final clip to ensure bounds after adjustment
+    rates = np.clip(rates, min_rate, max_rate)
     
     return rates * 100  # Convert to percentage
 
@@ -586,24 +579,25 @@ def fetch_abs_historical_growth(suburb):
     current_year = datetime.now().year
     start_year = current_year - 50
     
-    payload = {
-        "model": "sonar-pro",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are an ABS data specialist. Return only numerical year-on-year Australian housing growth rates from ABS housing data."
-            },
-            {
-                "role": "user",
-                "content": f"""Return a JSON array of year-on-year housing price growth rates for {suburb} 
-                              from {start_year} to {current_year} using ABS data from the domain abs.gov.au only. 
-                              Format: [growth_rate1, growth_rate2, ...] 
-                              Include exactly {current_year - start_year} values."""
-            }
-        ],
-        "temperature": 0.0,
-        # "search_domain_filter": "abs.gov.au" # Retricted perplexity function. Requires Tier 3 usage.
-    }
+    # Not Working ABS doesn't have this data public
+    # payload = {
+    #     "model": "sonar-pro",
+    #     "messages": [
+    #         {
+    #             "role": "system",
+    #             "content": "You are an ABS data specialist. Return only numerical year-on-year Australian housing growth rates from ABS housing data."
+    #         },
+    #         {
+    #             "role": "user",
+    #             "content": f"""Return a JSON array of year-on-year housing price growth rates for {suburb} 
+    #                           from {start_year} to {current_year} using ABS data from the domain abs.gov.au only. 
+    #                           Format: [growth_rate1, growth_rate2, ...] 
+    #                           Include exactly {current_year - start_year} values."""
+    #         }
+    #     ],
+    #     "temperature": 0.0,
+    #     # "search_domain_filter": "abs.gov.au" # Retricted perplexity function. Requires Tier 3 usage.
+    # }
 
     try:
         response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS)
@@ -640,7 +634,7 @@ def fetch_abs_historical_growth(suburb):
         return np.array(growth_rates)
 
     except Exception as e:
-        logging.error(f"Error fetching historical growth for {suburb}: {str(e)}")
+        # logging.error(f"Error fetching historical growth for {suburb}: {str(e)}")
         return generate_default_growth_rates(current_year - start_year)
 
 def calculate_location_premium(distance_km, public_transport_score):
