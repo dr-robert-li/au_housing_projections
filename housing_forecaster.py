@@ -97,6 +97,13 @@ def log_api_response(suburb: str, payload: dict, response: requests.Response) ->
 # Debugging Flag
 VERBOSE = False
 
+# number cleaner helper
+def clean_numeric_value(value):
+    """Convert string numbers with commas to float"""
+    if isinstance(value, str):
+        return float(value.replace(',', ''))
+    return float(value)
+
 def fetch_top_growth_suburbs(state=None, limit=10, retries=3, verbose: Optional[bool] = None):
     if verbose is not None:
         set_verbose(verbose)
@@ -864,6 +871,40 @@ def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
 
     return final_growth
 
+def calculate_growth_rates(projections):
+    """Calculate average annual growth rates for different time horizons"""
+    years = projections['years']
+    nominal = projections['nominal']['median_projection']
+    inflation_adj = projections['inflation_adjusted']['median_projection']
+    
+    # Find indices for time horizons
+    yr5_idx = next(i for i, y in enumerate(years) if y-years[0] >= 5)
+    yr25_idx = next(i for i, y in enumerate(years) if y-years[0] >= 25)
+    yr50_idx = -1  # Last index
+    
+    # Calculate compound annual growth rates
+    def calc_cagr(start_value, end_value, years):
+        return (((end_value / start_value) ** (1/years)) - 1) * 100
+
+    growth_rates = {
+        "growth_rates": {
+            "5_year": {
+                "nominal": calc_cagr(nominal[0], nominal[yr5_idx], 5),
+                "inflation_adjusted": calc_cagr(inflation_adj[0], inflation_adj[yr5_idx], 5)
+            },
+            "25_year": {
+                "nominal": calc_cagr(nominal[0], nominal[yr25_idx], 25),
+                "inflation_adjusted": calc_cagr(inflation_adj[0], inflation_adj[yr25_idx], 25)
+            },
+            "50_year": {
+                "nominal": calc_cagr(nominal[0], nominal[yr50_idx], 50),
+                "inflation_adjusted": calc_cagr(inflation_adj[0], inflation_adj[yr50_idx], 50)
+            }
+        }
+    }
+    
+    return growth_rates
+
 def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None):
     """Generate forecasts for multiple suburbs with optional property criteria"""
     # Fetch current data and API response with property criteria
@@ -891,7 +932,7 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
     # For each suburb, add price projections
     for suburb, suburb_info in data_dict['suburbs'].items():
         # Get base price and inflation metrics for this suburb
-        base_price = suburb_info['median_price']['value']
+        base_price = clean_numeric_value(suburb_info['median_price']['value'])
         forecast_inflation = suburb_info['inflation']['forecast']['value']
         inflation_volatility = suburb_info['inflation']['volatility']['value']
         
@@ -1042,6 +1083,10 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
                 }
             }
         }
+
+        # Calculate YoY growth rates
+        growth_rates = calculate_growth_rates(suburb_info['price_projections'])
+        suburb_info.update(growth_rates)
     
     return plot_paths, json.dumps(data_dict, indent=4)
 
@@ -1325,6 +1370,18 @@ def save_forecast_data(api_data, format='json'):
                 f.write(f"Forecast Inflation: {data['inflation']['forecast']['value']}%\n")
                 f.write(f"Inflation Volatility: {data['inflation']['volatility']['value']}%\n\n")
                 f.write("-" * 80 + "\n\n")
+
+                # Growth rates 
+                f.write("Growth Rates:\n")
+                f.write("5-Year:\n")
+                f.write(f"  Nominal: {data['growth_rates']['5_year']['nominal']:.2f}%\n")
+                f.write(f"  Inflation-Adjusted: {data['growth_rates']['5_year']['inflation_adjusted']:.2f}%\n")
+                f.write("25-Year:\n")
+                f.write(f"  Nominal: {data['growth_rates']['25_year']['nominal']:.2f}%\n")
+                f.write(f"  Inflation-Adjusted: {data['growth_rates']['25_year']['inflation_adjusted']:.2f}%\n")
+                f.write("50-Year:\n")
+                f.write(f"  Nominal: {data['growth_rates']['50_year']['nominal']:.2f}%\n")
+                f.write(f"  Inflation-Adjusted: {data['growth_rates']['50_year']['inflation_adjusted']:.2f}%\n\n")
     
     elif format == 'xlsx' or format == 'csv':
         df = pd.DataFrame(columns=[
@@ -1376,7 +1433,13 @@ def save_forecast_data(api_data, format='json'):
             'Demographic Premium',
             'Current Inflation (%)',
             'Forecast Inflation (%)',
-            'Inflation Volatility (%)'
+            'Inflation Volatility (%)',
+            '5yr Nominal Growth (%)',
+            '5yr Real Growth (%)',
+            '25yr Nominal Growth (%)',
+            '25yr Real Growth (%)',
+            '50yr Nominal Growth (%)',
+            '50yr Real Growth (%)'
         ])
         
         for suburb, data in data_dict['suburbs'].items():
@@ -1452,7 +1515,13 @@ def save_forecast_data(api_data, format='json'):
                 })),
                 'Current Inflation (%)': data['inflation']['current']['value'],
                 'Forecast Inflation (%)': data['inflation']['forecast']['value'],
-                'Inflation Volatility (%)': data['inflation']['volatility']['value']
+                'Inflation Volatility (%)': data['inflation']['volatility']['value'],
+                '5yr Nominal Growth (%)': data['growth_rates']['5_year']['nominal'],
+                '5yr Real Growth (%)': data['growth_rates']['5_year']['inflation_adjusted'],
+                '25yr Nominal Growth (%)': data['growth_rates']['25_year']['nominal'],
+                '25yr Real Growth (%)': data['growth_rates']['25_year']['inflation_adjusted'],
+                '50yr Nominal Growth (%)': data['growth_rates']['50_year']['nominal'],
+                '50yr Real Growth (%)': data['growth_rates']['50_year']['inflation_adjusted']
             }])], ignore_index=True)
         
         if format == 'xlsx':
