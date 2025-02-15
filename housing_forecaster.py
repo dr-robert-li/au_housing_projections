@@ -574,12 +574,15 @@ def generate_default_growth_rates(num_years):
     
     # Wider bounds for more extreme cycles (0% to 12%)
     rates = np.clip(rates, 0.0, 0.12)
+    rates = rates * 100  # Convert to percentage
+    
+    return rates, 'DEFAULT'
     
     # Adjust to maintain long-term average close to base_rate
     average_adjustment = base_rate - np.mean(rates)
     rates += average_adjustment
     
-    return rates * 100  # Convert to percentage
+    return rates_with_source
 
 def fetch_abs_historical_growth(suburb):
     """Fetch historical housing growth data from ABS for the past 50 years"""
@@ -596,13 +599,12 @@ def fetch_abs_historical_growth(suburb):
             {
                 "role": "user",
                 "content": f"""Return a JSON array of year-on-year housing price growth rates for {suburb} 
-                              from {start_year} to {current_year} using ABS data from the domain abs.gov.au only. 
+                              from {start_year} to {current_year} using ABS data. 
                               Format: [growth_rate1, growth_rate2, ...] 
                               Include exactly {current_year - start_year} values."""
             }
         ],
-        "temperature": 0.0,
-        # "search_domain_filter": "abs.gov.au" # Retricted perplexity function. Requires Tier 3 usage.
+        "temperature": 0.1
     }
 
     try:
@@ -613,31 +615,29 @@ def fetch_abs_historical_growth(suburb):
         logging.debug(f"Response content: {response.text}")
         
         # Handle different response status codes
-        if response.status_code == 400:
-            logging.warning(f"Bad request for {suburb} - using default growth rates")
+        if response.status_code != 200:
+            logging.warning(f"API request failed for {suburb} with status {response.status_code}")
             return generate_default_growth_rates(current_year - start_year)
             
-        response.raise_for_status()
-        
         content = response.json()['choices'][0]['message']['content']
         
-        # Strip Chain of Thought reasoning if present
-        if '<think>' in content:
-            content = content.split('```json')[1].split('```')[0]
-
-        # Find JSON array bounds
+        # Find JSON array bounds more robustly
         json_start = content.find('[')
         json_end = content.rfind(']') + 1
         
-        # Extract and parse JSON array
-        growth_rates = json.loads(content[json_start:json_end])
-        
-        # Validate growth rates
-        if len(growth_rates) != current_year - start_year:
-            logging.warning(f"Invalid number of growth rates for {suburb} - using default rates")
+        if json_start == -1 or json_end == 0:
+            logging.warning(f"No valid JSON array found in response for {suburb}")
             return generate_default_growth_rates(current_year - start_year)
             
-        return np.array(growth_rates)
+        json_str = content[json_start:json_end]
+        
+        try:
+            growth_rates = json.loads(json_str)
+            rates = np.array(growth_rates)
+            return rates, 'ABS'
+        except json.JSONDecodeError as e:
+            logging.warning(f"JSON parsing failed for {suburb}: {str(e)}")
+            return generate_default_growth_rates(current_year - start_year)
 
     except Exception as e:
         logging.error(f"Error fetching historical growth for {suburb}: {str(e)}")
@@ -1100,7 +1100,7 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         inflation_adj_upper_std = inflation_adj_median + np.std(inflation_adjusted_projections, axis=0)
 
         # Get historical ABS growth rates
-        historical_rates = fetch_abs_historical_growth(suburb)
+        historical_rates, data_source = fetch_abs_historical_growth(suburb)
         historical_prices = base_price * np.cumprod(1 + historical_rates/100)
         
         # Verify dimensions match before plotting
@@ -1126,9 +1126,12 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         plt.fill_between(years, inflation_adj_lower_std, inflation_adj_upper_std, alpha=0.2, color='#2ecc71', label='Inflation-Adjusted 68% CI')
         plt.plot(years, inflation_adj_median, label='Inflation-Adjusted Median', color='#2ecc71', linewidth=2)
         
+        # Set label based on data source
+        history_label = "ABS Historical Growth Pattern" if data_source == 'ABS' else "Default Historical Growth Pattern"
+    
         # Add historical line to plot
         plt.plot(years, historical_prices, 
-                label='Historical Growth Pattern', 
+                label=history_label, 
                 color='#e74c3c',
                 linestyle='--',
                 linewidth=1.5,
