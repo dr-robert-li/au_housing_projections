@@ -579,7 +579,7 @@ def fetch_abs_historical_growth(suburb):
     current_year = datetime.now().year
     start_year = current_year - 50
     
-    # Not Working ABS doesn't have this data public
+    # Not Working ABS doesn't have this data publicly
     # payload = {
     #     "model": "sonar-pro",
     #     "messages": [
@@ -599,43 +599,43 @@ def fetch_abs_historical_growth(suburb):
     #     # "search_domain_filter": "abs.gov.au" # Retricted perplexity function. Requires Tier 3 usage.
     # }
 
-    try:
-        response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS)
+    # try:
+    #     response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS)
         
-        # Log the response for debugging
-        logging.debug(f"API Response for {suburb}: Status {response.status_code}")
-        logging.debug(f"Response content: {response.text}")
+    #     # Log the response for debugging
+    #     logging.debug(f"API Response for {suburb}: Status {response.status_code}")
+    #     logging.debug(f"Response content: {response.text}")
         
-        # Handle different response status codes
-        if response.status_code == 400:
-            logging.warning(f"Bad request for {suburb} - using default growth rates")
-            return generate_default_growth_rates(current_year - start_year)
+    #     # Handle different response status codes
+    #     if response.status_code != 200:
+    #         logging.warning(f"API request failed for {suburb} with status {response.status_code}")
+    #         return generate_default_growth_rates(current_year - start_year)
             
-        response.raise_for_status()
+    #     content = response.json()['choices'][0]['message']['content']
         
-        content = response.json()['choices'][0]['message']['content']
+    #     # Find JSON array bounds more robustly
+    #     json_start = content.find('[')
+    #     json_end = content.rfind(']') + 1
         
-        # Strip Chain of Thought reasoning if present
-        if '<think>' in content:
-            content = content.split('```json')[1].split('```')[0]
-
-        # Find JSON array bounds
-        json_start = content.find('[')
-        json_end = content.rfind(']') + 1
-        
-        # Extract and parse JSON array
-        growth_rates = json.loads(content[json_start:json_end])
-        
-        # Validate growth rates
-        if len(growth_rates) != current_year - start_year:
-            logging.warning(f"Invalid number of growth rates for {suburb} - using default rates")
-            return generate_default_growth_rates(current_year - start_year)
+    #     if json_start == -1 or json_end == 0:
+    #         logging.warning(f"No valid JSON array found in response for {suburb}")
+    #         return generate_default_growth_rates(current_year - start_year)
             
-        return np.array(growth_rates)
+    #     json_str = content[json_start:json_end]
+        
+    #     try:
+    #         growth_rates = json.loads(json_str)
+    #         rates = np.array(growth_rates)
+    #         return rates, 'ABS'
+    #     except json.JSONDecodeError as e:
+    #         logging.warning(f"JSON parsing failed for {suburb}: {str(e)}")
+    #         rates = generate_default_growth_rates(current_year - start_year)
+    #         return rates, 'DEFAULT'  
 
-    except Exception as e:
-        # logging.error(f"Error fetching historical growth for {suburb}: {str(e)}")
-        return generate_default_growth_rates(current_year - start_year)
+    # except Exception as e:
+        # Return default rates with source identifier
+    rates = generate_default_growth_rates(current_year - start_year)
+    return rates, 'DEFAULT'
 
 def calculate_location_premium(distance_km, public_transport_score):
     """
@@ -1094,7 +1094,7 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         inflation_adj_upper_std = inflation_adj_median + np.std(inflation_adjusted_projections, axis=0)
 
         # Get historical ABS growth rates
-        historical_rates = fetch_abs_historical_growth(suburb)
+        historical_rates, data_source = fetch_abs_historical_growth(suburb)
         historical_prices = base_price * np.cumprod(1 + historical_rates/100)
         
         # Verify dimensions match before plotting
@@ -1120,9 +1120,12 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         plt.fill_between(years, inflation_adj_lower_std, inflation_adj_upper_std, alpha=0.2, color='#2ecc71', label='Inflation-Adjusted 68% CI')
         plt.plot(years, inflation_adj_median, label='Inflation-Adjusted Median', color='#2ecc71', linewidth=2)
         
+        # Set label based on data source
+        history_label = "ABS Historical Growth Pattern" if data_source == 'ABS' else "Default Historical Growth Pattern"
+    
         # Add historical line to plot
         plt.plot(years, historical_prices, 
-                label='Historical Growth Pattern', 
+                label=history_label, 
                 color='#e74c3c',
                 linestyle='--',
                 linewidth=1.5,
