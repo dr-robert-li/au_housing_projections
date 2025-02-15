@@ -1331,15 +1331,20 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
 
     submit_btn = gr.Button("Generate Forecasts", variant="primary")
     
-    forecast_gallery = gr.Gallery(label="Price Projections")
+    forecast_gallery = gr.Gallery(
+        label="Price Projections",
+        height="h-120", 
+        columns=[2],     # Optional: adjust columns for better layout
+        allow_preview=True
+    )
 
     reasoning_output = gr.Textbox(
         label="Forecast Reasoning",
         interactive=False,
-        lines=15,
+        lines=5,
         max_lines=1000,
         show_copy_button=True,
-        visible=False
+        visible=True
     )
     
     with gr.Row():
@@ -1409,8 +1414,8 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
         return None if value == 0 else value
     
     def forecast_with_processing(suburbs, dwelling_type, bedrooms, bathrooms, car_spaces, 
-                               land_size, max_price, verbose, current_logs, include_reasoning):
-        """Enhanced wrapper with verbose logging integration"""
+                           land_size, max_price, verbose, include_reasoning):
+        """Enhanced wrapper with verbose logging integration and optional reasoning"""
         set_verbose(verbose)
         
         processed_suburbs = process_suburb_input(suburbs)
@@ -1425,18 +1430,21 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
             process_input(land_size),
             process_input(max_price)
         )
-
-        # Generate reasoning for forecasts
-        reasoning = None
+        
+        # Generate reasoning only if requested
+        reasoning_text = None
         if include_reasoning:
-            reasoning = generate_forecast_reasoning(json.loads(api_data), verbose)
+            reasoning_text, _ = generate_forecast_reasoning(json.loads(api_data), verbose)
         
-        # Combine existing logs with new API logs
+        # Get current logs
         logs = textbox_handler.get_logs()
-        if current_logs:
-            logs = current_logs + "\n" + logs
         
-        return plots, api_data, reasoning, logs
+        return [
+            plots, 
+            api_data, 
+            reasoning_text if reasoning_text else "Enable 'Include Detailed Reasoning' for analysis", 
+            logs
+        ]
     
     submit_btn.click(
         fn=forecast_with_processing,
@@ -1449,7 +1457,7 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
             land_size_input,
             max_price_input,
             verbose_checkbox,
-            logging_output,
+            # logging_output,
             include_reasoning
         ],
         outputs=[forecast_gallery, api_output, reasoning_output, logging_output]
