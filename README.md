@@ -1,8 +1,8 @@
 # 🏡 Australian Suburb Housing Price Forecaster
-### Version 1.0
+### Version 1.1
 ### Author: Robert Li ([dr-robert-li](https://github.com/dr-robert-li/))
     
-This Machine Learning powered application uses finetuned XGBoost advanced regression model to forecast housing prices for Australian suburbs over a 50-year period using machine learning and real estate market data.
+This Machine Learning powered application uses finetuned XGBoost advanced regression model and a hedonic model of valuation to forecast housing prices for Australian suburbs over a 50-year period using machine learning and real estate market data.
 
 ## Features
 
@@ -18,27 +18,42 @@ This Machine Learning powered application uses finetuned XGBoost advanced regres
 - Land Size (sqm)
 - Max Initial Median Price (AUD)
 - Setting any criteria to 0 analyzes all properties
+- Dwelling Type Selection:
+  - House: Traditional single-family homes
+  - Apartment: Multi-unit residential buildings
+  - Townhouse: Connected row housing
 
 ### Advanced Analytics
 - 50-year price projections with confidence intervals
 - Monte Carlo simulations for price modeling
 - Multiple confidence intervals (1 Std.d 68% and 2 Std.d 95%)
 - Key market indicators:
+  - Dwelling type specific growth adjustments
   - School quality scores
   - Infrastructure ratings
   - Flood and climate risk assessments
   - Population growth trends
   - Public transport accessibility
   - Distance to CBD based decay
+  - Quality and distance of commercial centers
+  - Quality and distance of parks and bodies of water
+  - Household demographics
+    - Income
+    - Age
+    - Size
   - Supply Market Analysis
     - Current months of housing inventory
     - Supply ratio benchmarking against 6-month standard
     - Dynamic growth adjustments based on supply conditions
 
+### Optional Deep Reasoning
+
+Detailed explanations for price forecasts based on Deep Reasoning model exportable in RTF and TXT formats.
+
 ### Model Fine-tuning
 - Progressive learning with synthetic data generation
 - Supply-aware parameter adjustments
-- Volatility modeling for different market conditions
+- Volatility modeling for different market conditions and dwelling types
 - Confidence interval calculations using Monte Carlo simulations
 
 ### Data Export Options

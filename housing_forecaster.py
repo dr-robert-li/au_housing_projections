@@ -3,18 +3,43 @@ import pandas as pd
 import numpy as np
 import json
 import csv
+import re
 import json
 import time
 import requests
+from typing import Optional
+import logging
 from dotenv import load_dotenv
 import os
 from datetime import datetime
 from pathlib import Path
 import matplotlib.pyplot as plt
+import matplotlib.font_manager
 from huggingface_hub import hf_hub_download
 import joblib
 from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
+
+class TextboxHandler(logging.Handler):
+    """Custom logging handler that stores logs for Gradio textbox"""
+    def __init__(self):
+        super().__init__()
+        self.logs = []
+        
+    def emit(self, record):
+        log_entry = self.format(record)
+        self.logs.append(log_entry)
+        
+    def get_logs(self):
+        return "\n".join(self.logs)
+        
+    def clear(self):
+        self.logs = []
+
+class FontDebugFilter(logging.Filter):
+    """Filter to exclude matplotlib font debug messages"""
+    def filter(self, record):
+        return not (record.levelname == 'DEBUG' and 'findfont' in record.msg)
 
 # Load pretrained XGBoost model
 model_path = hf_hub_download(
@@ -36,17 +61,56 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def fetch_top_growth_suburbs(state=None, limit=10, retries=3):
+# Initialize logging handler
+textbox_handler = TextboxHandler()
+textbox_handler.addFilter(FontDebugFilter())
+textbox_handler.setFormatter(
+    logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+)
+
+# Configure root logger
+logging.getLogger().addHandler(textbox_handler)
+
+# Filter matplotlib's font logger
+matplotlib_logger = logging.getLogger('matplotlib.font_manager')
+matplotlib_logger.addFilter(FontDebugFilter())
+
+def set_verbose(enabled: bool) -> None:
+    """Enable or disable verbose logging"""
+    global VERBOSE
+    VERBOSE = enabled
+    level = logging.DEBUG if enabled else logging.WARNING
+    logging.getLogger().setLevel(level)
+    textbox_handler.clear() 
+
+def log_api_response(suburb: str, payload: dict, response: requests.Response) -> None:
+    """Log API request/response details if verbose mode enabled"""
+    if not VERBOSE:
+        return
+        
+    logging.debug(f"\n=== API Call for {suburb} ===")
+    logging.debug(f"Request Payload:\n{json.dumps(payload, indent=2)}")
+    logging.debug(f"Response Status: {response.status_code}")
+    logging.debug(f"Response Content:\n{response.text}\n")
+
+# Debugging Flag
+VERBOSE = False
+
+def fetch_top_growth_suburbs(state=None, limit=10, retries=3, verbose: Optional[bool] = None):
+    if verbose is not None:
+        set_verbose(verbose)
+    
     payload = {
         "model": "sonar-pro",
         "messages": [
             {
                 "role": "system",
-                "content": "You are an expert Australian real estate analyst. Return only a JSON array of suburb strings."
+                "content": "You are an expert Australian real estate analyst. Return only a clean JSON array of suburb strings without any additional text or reasoning."
             },
             {
                 "role": "user",
-                "content": f"Return a JSON array of exactly {limit} top growth suburbs " +
+                "content": f"Return a JSON array of exactly {limit} top growth suburbs" +
+                          "for the last 12 months " + # bias recency   
                           (f"in {state} " if state else "in Australia ") +
                           "based on projected 5-year growth rate. " +
                           "Format each suburb as 'Suburb STATE' where STATE is the 2-3 letter code. " +
@@ -54,13 +118,22 @@ def fetch_top_growth_suburbs(state=None, limit=10, retries=3):
             }
         ],
         "temperature": 0.2,
-        "search_recency_filter": "month"
+        # "top_k": 4
+        # "search_recency_filter": "month"
     }
     
     for attempt in range(retries):
         try:
             response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS)
             response.raise_for_status()
+            logging.debug(f"State: {state if state else 'All Australia'}")
+            logging.debug(f"Limit: {limit}")
+            logging.debug(f"Attempt: {attempt + 1}/{retries}")
+            log_api_response(payload, response)
+
+            # strip CoT
+            if '<think>' in response:
+                response = response.split('```json')[1].split('```')[0]
             
             data = response.json()
             content = data['choices'][0]['message']['content']
@@ -71,7 +144,16 @@ def fetch_top_growth_suburbs(state=None, limit=10, retries=3):
             
             suburbs = json.loads(json_str)
             return suburbs[:limit]
+        
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON parsing error: {str(e)}")
+            logging.error(f"Raw response:\n{response.text}")
+            if attempt == retries - 1:
+                raise gr.Error(f"Invalid response format for {state if state else 'Australia'}.")
+            time.sleep(2 ** attempt)
             
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")    
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt == retries - 1:
@@ -129,7 +211,23 @@ def process_suburb_input(suburb_text):
     # Return exact suburbs provided without fetching additional ones
     return input_lines
 
-def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None):
+def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None, verbose: Optional[bool] = None):
+    """
+    Fetch suburb data with property type specifications
+    
+    Parameters:
+        suburbs (str): Newline-separated list of suburbs
+        dwelling_type (str): Type of property (house, apartment, townhouse)
+        bedrooms (int, optional): Number of bedrooms
+        bathrooms (int, optional): Number of bathrooms
+        car_spaces (int, optional): Number of car spaces
+        land_size (float, optional): Land size in square meters
+        max_price (float, optional): Maximum median price filter
+        verbose (bool, optional): Enable detailed logging
+    """
+    if verbose is not None:
+        set_verbose(verbose)
+
     for attempt in range(3):  # Try up to 3 times
         try:
             all_data = {"suburbs": {}}
@@ -145,7 +243,8 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "You are an expert Australian real estate analyst. Return average property metrics from the last 12 months."
+                                "content": "You are an expert Australian real estate analyst. Return average property metrics." +
+                                    "Only use data published in the last 12 months. " # bias recency
                             },
                             {
                                 "role": "user",
@@ -159,16 +258,22 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
                             }
                         ],
                         "temperature": 0.0,
-                        "top_k": 4
+                        # "top_k": 4
                         # "search_recency_filter": "month"
                     }
                     
                     default_response = requests.post(PERPLEXITY_API_URL, json=default_payload, headers=HEADERS)
                     default_response.raise_for_status()
                     default_content = default_response.json()['choices'][0]['message']['content']
+
+                    # strip CoT
+                    if '<think>' in default_content:
+                        default_content = default_content.split('```json')[1].split('```')[0]
+
                     default_json_start = default_content.find('{')
                     default_json_end = default_content.rfind('}') + 1
                     default_data = json.loads(default_content[default_json_start:default_json_end])
+                    log_api_response(suburb, default_payload, default_response)
 
                     # Get housing inventory data
                     inventory_payload = {
@@ -184,7 +289,7 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
                             }
                         ],
                         "temperature": 0.0,
-                        "top_k": 2
+                        # "top_k": 2
                         # "search_recency_filter": "month" # Too Granular
                     }
 
@@ -193,6 +298,7 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
                     inventory_content = inventory_response.json()['choices'][0]['message']['content']
                     inventory_months = float(inventory_content)
                     supply_ratio = inventory_months / 6  # Normalize against 6-month benchmark
+                    log_api_response(suburb, inventory_payload, inventory_response)
 
                     # Then get specific or default data
                     criteria = []
@@ -216,24 +322,65 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "You are an expert Australian real estate analyst. Return only a JSON object with numerical values and their units/ranges."
+                                "content": "You are an expert Australian real estate analyst. Return only a JSON object with numerical values and their units/ranges." +
+                                    "Only use data published in the last 12 months. " # bias recency
                             },
                             {
                                 "role": "user",
-                                "content": f"""Return a JSON object for {suburb}, Australia{criteria_str}, in the last 12 months, with:
+                                "content": f"""Return a JSON object for {suburb}, Australia{criteria_str}, with:
                                 {{
                                     "median_price": {{ "value": (price), "unit": "AUD" }},
+                                    "dwelling_type": "{dwelling_type}",
                                     "bedrooms": {{ "value": {bedrooms if bedrooms else "(number)"}, "range": "1-6" }},
                                     "bathrooms": {{ "value": {bathrooms if bathrooms else "(number)"}, "range": "1-4" }},
                                     "car_spaces": {{ "value": {car_spaces if car_spaces else "(number)"}, "range": "0-3" }},
                                     "land_size": {{ "value": {land_size if land_size else "(size)"}, "unit": "sqm" }},
                                     "distance_to_cbd": {{ "value": (distance), "unit": "km" }},
+                                    "commercial_centers": {{
+                                        "major": {{ 
+                                            "count": (number), 
+                                            "avg_distance": (km),
+                                            "size_score": {{ "value": (score), "range": "1-10" }}
+                                        }},
+                                        "local": {{ 
+                                            "count": (number), 
+                                            "avg_distance": (km),
+                                            "retail_quality": {{ "value": (score), "range": "1-10" }}
+                                        }}
+                                    }},
                                     "school_quality": {{ "value": (score), "range": "1-10" }},
                                     "infrastructure_score": {{ "value": (score), "range": "1-10" }},
+                                    "water_features": {{
+                                        "distance": {{ "value": (distance), "unit": "km" }},
+                                        "type": "beach/river/harbor"
+                                    }},
+                                    "parks": {{
+                                        "quality_score": {{ "value": (score), "range": "1-10" }},
+                                        "distance": {{ "value": (distance), "unit": "km" }}
+                                    }},
+                                    "zoning": {{
+                                        "view_protection": {{ "value": true/false }},
+                                        "height_restrictions": {{ "value": (meters) }}
+                                    }},
                                     "flood_risk": {{ "value": (risk), "range": "1-10" }},
                                     "population_growth": {{ "value": (rate), "unit": "% per year" }},
                                     "climate_risk": {{ "value": (risk), "range": "1-10" }},
-                                    "public_transport": {{ "value": (score), "range": "1-10" }}
+                                    "public_transport": {{ "value": (score), "range": "1-10" }}.
+                                    "demographics": {{
+                                        "median_age": {{ "value": (age), "unit": "years" }},
+                                        "household_size": {{ "value": (size), "unit": "persons" }},
+                                        "household_income": {{ "value": (income), "unit": "AUD_weekly" }},
+                                        "family_composition": {{
+                                            "couples_with_children": {{ "value": (percentage), "unit": "percent" }},
+                                            "couples_no_children": {{ "value": (percentage), "unit": "percent" }},
+                                            "single_parent": {{ "value": (percentage), "unit": "percent" }}
+                                        }},
+                                        "age_distribution": {{
+                                            "under_35": {{ "value": (percentage), "unit": "percent" }},
+                                            "35_to_65": {{ "value": (percentage), "unit": "percent" }},
+                                            "over_65": {{ "value": (percentage), "unit": "percent" }}
+                                        }}
+                                    }}
                                 }}"""
                             }
                         ],
@@ -245,10 +392,16 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
                     response = requests.post(PERPLEXITY_API_URL, json=suburb_payload, headers=HEADERS)
                     response.raise_for_status()
                     content = response.json()['choices'][0]['message']['content']
+
+                    # strip CoT
+                    if '<think>' in content:
+                        content = content.split('```json')[1].split('```')[0]
+
                     json_start = content.find('{')
                     json_end = content.rfind('}') + 1
                     suburb_data = json.loads(content[json_start:json_end])
-                    
+                    log_api_response(suburb, suburb_payload, response)
+                   
                     # Add supply ratio to suburb_data
                     suburb_data["supply_ratio"] = {
                         "value": supply_ratio,
@@ -274,21 +427,63 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
                     df = pd.DataFrame([{
                         'suburb': suburb,
                         'median_price': suburb_data['median_price']['value'],
+                        'dwelling_type': suburb_data['dwelling_type'],
                         'bedrooms': suburb_data['bedrooms']['value'],
                         'bathrooms': suburb_data['bathrooms']['value'],
                         'car_spaces': suburb_data['car_spaces']['value'],
                         'land_size': suburb_data['land_size']['value'],
                         'distance_to_cbd': suburb_data['distance_to_cbd']['value'],
+                        'major_commercial_count': suburb_data['commercial_centers']['major']['count'],
+                        'major_commercial_distance': suburb_data['commercial_centers']['major']['avg_distance'],
+                        'major_center_size_score': suburb_data['commercial_centers']['major']['size_score']['value'],
+                        'local_commercial_count': suburb_data['commercial_centers']['local']['count'],
+                        'local_commercial_distance': suburb_data['commercial_centers']['local']['avg_distance'],
+                        'retail_quality_score': suburb_data['commercial_centers']['local']['retail_quality']['value'],
                         'school_quality': suburb_data['school_quality']['value'],
                         'infrastructure_score': suburb_data['infrastructure_score']['value'],
                         'flood_risk': suburb_data['flood_risk']['value'],
                         'population_growth': suburb_data['population_growth']['value'],
                         'climate_risk': suburb_data['climate_risk']['value'],
                         'public_transport': suburb_data['public_transport']['value'],
-                        'supply_ratio': suburb_data['supply_ratio']['value']
+                        'supply_ratio': suburb_data['supply_ratio']['value'],
+                        'water_distance': suburb_data['water_features']['distance']['value'],
+                        'water_type': suburb_data['water_features']['type'],
+                        'water_premium': calculate_water_premium(
+                            suburb_data['water_features']['distance']['value'],
+                            suburb_data['water_features']['type']
+                        ),
+                        'park_distance': suburb_data['parks']['distance']['value'],
+                        'park_quality': suburb_data['parks']['quality_score']['value'],
+                        'park_premium': calculate_park_premium(
+                            suburb_data['parks']['distance']['value'],
+                            suburb_data['parks']['quality_score']['value']
+                        ),
+                        'view_protection': suburb_data['zoning']['view_protection']['value'],
+                        'height_restriction': suburb_data['zoning']['height_restrictions']['value'],
+                        'view_premium': calculate_view_premium(
+                            suburb_data['zoning']['view_protection']['value'],
+                            suburb_data['zoning']['height_restrictions']['value']
+                        ),
+                        'risk_adjustment': calculate_risk_adjustments(
+                            suburb_data['flood_risk']['value'],
+                            suburb_data['climate_risk']['value']
+                        ),
+                        'median_age': suburb_data['demographics']['median_age']['value'],
+                        'household_size': suburb_data['demographics']['household_size']['value'],
+                        'household_income': suburb_data['demographics']['household_income']['value'],
+                        'couples_with_children': suburb_data['demographics']['family_composition']['couples_with_children']['value'],
+                        'couples_no_children': suburb_data['demographics']['family_composition']['couples_no_children']['value'],
+                        'single_parent': suburb_data['demographics']['family_composition']['single_parent']['value'],
+                        'population_under_35': suburb_data['demographics']['age_distribution']['under_35']['value'],
+                        'population_35_to_65': suburb_data['demographics']['age_distribution']['35_to_65']['value'],
+                        'population_over_65': suburb_data['demographics']['age_distribution']['over_65']['value']
                     }])
                     dataframes.append(df)
-                    
+
+                except json.JSONDecodeError as e:
+                    logging.error(f"JSON parsing error for {suburb}: {str(e)}")
+                    logging.error(f"Raw response:\n{response.text}")
+                    continue    
                 except Exception as e:
                     print(f"Error processing {suburb}: {str(e)}")
                     continue
@@ -299,6 +494,7 @@ def fetch_suburb_data(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, l
             return pd.concat(dataframes, ignore_index=True), json.dumps(all_data, indent=4)
         
         except Exception as e:
+            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt == 2:  # Last attempt
                 raise gr.Error("Failed to process suburb data after 3 attempts. Please try again.")
             print(f"Attempt {attempt + 1} failed: {str(e)}")
@@ -326,6 +522,93 @@ def calculate_location_premium(distance_km, public_transport_score):
         interaction_boost = 0.003
         
     return base_distance_impact + transport_premium + interaction_boost
+
+def calculate_commercial_premium(major_count, major_distance, major_size_score,
+                                local_count, local_distance, retail_quality):
+    """
+    Commercial premium calculation: 
+    - Major centers (0-1.2% premium)
+    - Local centers (0-0.6% premium)
+    - Synergy bonus for major + local centers
+    - Retail quality impact
+    - Distance decay
+    """
+    # Major center impact (0-1.2% premium)
+    major_decay = np.exp(-major_distance/8)  # 8km half-life
+    major_premium = min(0.012, 
+                      (major_count * 0.004 * major_size_score) * major_decay)
+    
+    # Local center impact (0-0.6% premium)
+    local_decay = np.exp(-local_distance/4)  # 4km half-life
+    local_premium = min(0.006, 
+                       (local_count * 0.002 * retail_quality) * local_decay)
+    
+    # Combined premium with synergy bonus
+    synergy_bonus = 0.0015 if (major_count >=1 and local_count >=3) else 0
+    return min(0.015, major_premium + local_premium + synergy_bonus)  # Max 1.5%
+
+def calculate_water_premium(distance_km, water_type):
+    """Calculate premium based on water proximity and type"""
+    base_premium = 0.12 * np.exp(-distance_km / 2)
+    
+    # Additional multipliers by water type
+    type_multipliers = {
+        'beach': 1.2,  # Beaches command highest premium
+        'harbor': 1.1, # Harbor views also valuable
+        'river': 0.9   # River proximity slightly lower
+    }
+    
+    return base_premium * type_multipliers.get(water_type.lower(), 1.0)
+
+def calculate_park_premium(distance_km, quality_score):
+    """Calculate premium for park proximity and quality"""
+    distance_decay = np.exp(-distance_km / 1.5)  # Steeper decay for parks
+    base_premium = 0.08 if quality_score >= 7 else 0.03
+    return base_premium * distance_decay
+
+def calculate_risk_adjustments(flood_risk_score, climate_risk_score):
+    """Calculate risk-based price adjustments"""
+    flood_discount = np.where(flood_risk_score > 5, -0.22, 0)
+    climate_discount = np.where(climate_risk_score > 7, -0.15, 0)
+    return flood_discount + climate_discount
+
+def calculate_view_premium(has_protection, height_limit):
+    """Calculate premium for protected views"""
+    base_premium = 0.15 if has_protection else 0
+    
+    # Additional premium for strict height limits
+    height_premium = 0
+    if height_limit and height_limit < 15:  # 15m ~ 5 stories
+        height_premium = 0.05
+        
+    return base_premium + height_premium
+
+def calculate_demographic_premium(row):
+    """Calculate premium based on demographic factors"""
+    # Age-based adjustments
+    youth_premium = 0.002 * (row['population_under_35'] / 100)
+    aging_impact = -0.001 * (row['population_over_65'] / 100)
+    
+    # Family composition impact
+    family_premium = (
+        0.0015 * (row['couples_with_children'] / 100) +
+        0.0008 * (row['couples_no_children'] / 100)
+    )
+    
+    # Income effects with dwelling type consideration
+    income_multiplier = 1.2 if row['dwelling_type'] == 'house' else 0.9
+    income_premium = (
+        0.0004 * (row['household_income'] / 1000) * 
+        income_multiplier
+    )
+    
+    # Household size impact
+    size_premium = 0.0003 * row['household_size'] * (
+        1.2 if row['dwelling_type'] == 'house' else 0.8
+    )
+    
+    return (youth_premium + aging_impact + family_premium + 
+            income_premium + size_premium)
 
 def fine_tune_model(model, new_data):
     """Incremental training with new suburb data including supply metrics"""
@@ -376,11 +659,140 @@ def fine_tune_model(model, new_data):
     
     return model
 
-def forecast_prices(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None):
+def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
+    """
+    Calculate moderated growth adjustments with research-backed coefficients
+    
+    Key Components:
+    1. Supply and Demand Metrics
+    2. Population and Migration Effects
+    3. Infrastructure and Location Impact
+    4. Demographic Factors
+    5. Risk Adjustments
+    6. Affordability Constraints
+    """
+    # Supply impact with continuous scaling (AHURI Report 281)
+    supply_impact = np.where(
+        suburb_data['supply_ratio'] < 0.5,
+        0.001 * (1 - suburb_data['supply_ratio']),  # Max 0.1% boost
+        np.where(
+            suburb_data['supply_ratio'] > 1.5,
+            -0.002 * (suburb_data['supply_ratio'] - 1),  # Scale with oversupply
+            0
+        )
+    )
+
+    # Population growth with migration effects
+    base_pop_growth = np.minimum(0.0025, 0.8 * suburb_data['population_growth'])
+    migration_boost = np.where(
+        suburb_data['population_growth'] > 2.5,
+        0.002 * (suburb_data['population_growth'] - 2.5),
+        0
+    )
+    pop_growth_adj = base_pop_growth + migration_boost
+
+    # Infrastructure impact with quality threshold
+    infra_adj = np.where(
+        suburb_data['infrastructure_score'] >= 7,
+        suburb_data['infrastructure_score'] * 0.0015,
+        suburb_data['infrastructure_score'] * 0.0005
+    )
+
+    # School quality premium with non-linear scaling
+    school_adj = np.power(suburb_data['school_quality']/10, 1.5) * 0.002
+
+    # Location premium with exponential decay (RBA distance model)
+    def location_decay(distance, pt_score):
+        base_decay = np.exp(-distance/8)  # 8km half-life
+        pt_boost = (pt_score/10) * 0.0005
+        return min(0.003, 0.002 * base_decay + pt_boost)
+
+    # Commercial premium with retail quality weighting
+    def commercial_impact(row):
+        major_decay = np.exp(-row['major_commercial_distance']/6)
+        local_decay = np.exp(-row['local_commercial_distance']/3)
+        return (
+            (row['major_commercial_count'] * 0.0004 * major_decay) +
+            (row['local_commercial_count'] * 0.0002 * local_decay * row['retail_quality_score']/10)
+        )
+
+    # Water premium with type differentiation
+    water_adj = np.where(
+        suburb_data['water_type'] == 'ocean',
+        0.0012 * np.exp(-suburb_data['water_distance']/2),
+        np.where(
+            suburb_data['water_type'] == 'river',
+            0.0008 * np.exp(-suburb_data['water_distance']/3),
+            0
+        )
+    )
+
+    # Park premium with quality threshold
+    park_adj = np.where(
+        suburb_data['park_quality'] >= 8,
+        0.0015 * np.exp(-suburb_data['park_distance']/2),
+        np.where(
+            suburb_data['park_quality'] >= 5,
+            0.0005 * np.exp(-suburb_data['park_distance']/1.5),
+            0
+        )
+    )
+
+    # Risk adjustments with progressive scaling
+    risk_adj = (
+        -0.0005 * np.power(suburb_data['flood_risk'], 1.2) +
+        -0.0003 * np.power(suburb_data['climate_risk'], 1.1)
+    )
+
+    # Housing type differentiation (PropertyUpdate 2025 predictions)
+    dwelling_adj = np.where(
+        suburb_data['dwelling_type'] == 'apartment',
+        0.0002,
+        np.where(
+            suburb_data['dwelling_type'] == 'townhouse',
+            0.0001,  # Moderate premium for townhouses
+            -0.0001  # Detached houses becoming less affordable
+        )
+    )
+
+    # Household size impact
+    household_size_adj = 0.0003 * (2.8 - suburb_data['household_size'])
+
+    # Demographic factors
+    demographic_adj = suburb_data.apply(calculate_demographic_premium, axis=1)
+
+    # Income-based affordability ceiling
+    annual_income = (suburb_data['household_income'] / 52) * 52  # Weekly to annual
+    income_ceiling = annual_income * 4.5  # APRA guideline multiplier
+    max_sustainable_growth = income_ceiling / suburb_data['median_price']
+
+    # Combine all adjustments
+    base_growth = (
+        pop_growth_adj +
+        infra_adj +
+        school_adj +
+        suburb_data.apply(lambda r: location_decay(r['distance_to_cbd'], r['public_transport']), axis=1) +
+        suburb_data.apply(commercial_impact, axis=1) +
+        water_adj +
+        park_adj +
+        risk_adj +
+        dwelling_adj +
+        demographic_adj +
+        household_size_adj +
+        supply_impact
+    )
+
+    # Apply affordability ceiling
+    final_growth = np.minimum(base_growth, max_sustainable_growth)
+
+    return final_growth
+
+def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None):
     """Generate forecasts for multiple suburbs with optional property criteria"""
     # Fetch current data and API response with property criteria
     suburb_data, api_response = fetch_suburb_data(
         suburbs,
+        dwelling_type=dwelling_type,
         bedrooms=bedrooms,
         bathrooms=bathrooms,
         car_spaces=car_spaces,
@@ -391,42 +803,9 @@ def forecast_prices(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, lan
     
     # Parse existing data
     data_dict = json.loads(api_response)
-
-    # Calculate supply impact on growth
-    supply_impact = np.where(
-        suburb_data['supply_ratio'] < 0.6,  # Severe undersupply
-        0.004,  # Strong growth premium
-        np.where(
-            suburb_data['supply_ratio'] < 0.8,  # Moderate undersupply
-            0.003,  # Moderate growth premium
-            np.where(
-                suburb_data['supply_ratio'] > 1.4,  # Severe oversupply
-                -0.005,  # Strong growth penalty
-                np.where(
-                    suburb_data['supply_ratio'] > 1.2,  # Moderate oversupply
-                    -0.003,  # Moderate growth penalty
-                    0  # Balanced market
-                )
-            )
-        )
-    )
     
     # Calculate base growth rate adjustments from suburb metrics
-    growth_adjustments = (
-        suburb_data['population_growth'] * 0.004 +  # Population growth has strong impact
-        suburb_data['infrastructure_score'] * 0.003 +  # Good infrastructure supports growth
-        suburb_data['school_quality'] * 0.002 +  # Quality schools attract families
-        suburb_data.apply(
-            lambda row: calculate_location_premium(
-                row['distance_to_cbd'], 
-                row['public_transport']
-            ),
-            axis=1
-        ) - # Non-linear distance decay and public transport premium
-        suburb_data['flood_risk'] * 0.002 -  # Risk factors reduce growth
-        suburb_data['climate_risk'] * 0.002 + # Climate impact on long-term value
-        supply_impact  # Supply impact on growth refer above
-    )
+    growth_adjustments = calculate_growth_adjustments(suburb_data)
     
     # Generate year range
     years = np.arange(2025, 2076)
@@ -520,8 +899,135 @@ def forecast_prices(suburbs, bedrooms=None, bathrooms=None, car_spaces=None, lan
     
     return plot_paths, json.dumps(data_dict, indent=4)
 
+def generate_forecast_reasoning(api_data: dict, verbose: bool = False) -> tuple[str, list[str]]:
+    """Generate detailed reasoning for price forecasts with citations"""
+    all_reasoning = []
+    all_citations = []
+    
+    for suburb, data in api_data['suburbs'].items():
+        # Construct reasoning request with comprehensive analysis points
+        reasoning_payload = {
+            "model": "sonar-reasoning-pro",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an expert Australian real estate analyst. Analyze property market data and provide detailed growth reasoning with citations. Format: <think>analysis</think> followed by citations: [urls]"
+                },
+                {
+                    "role": "user",
+                    "content": f"""Analyze 50-year price projections for {suburb} {data['dwelling_type']} properties considering:
+
+                    Property Characteristics:
+                    - Current median price: ${data['median_price']['value']:,.2f}
+                    - Property type: {data['dwelling_type']}
+                    - Configuration: {data['bedrooms']['value']} bed, {data['bathrooms']['value']} bath
+                    - Land size: {data['land_size']['value']} sqm
+                    
+                    Location & Infrastructure:
+                    - Distance to CBD: {data['distance_to_cbd']['value']}km
+                    - Public transport score: {data['public_transport']['value']}/10
+                    - Infrastructure score: {data['infrastructure_score']['value']}/10
+                    - School quality: {data['school_quality']['value']}/10
+                    
+                    Market Conditions:
+                    - Supply ratio: {data['supply_ratio']['value']:.2f}
+                    - Population growth: {data['population_growth']['value']}%
+                    
+                    Risk Factors:
+                    - Flood risk: {data['flood_risk']['value']}/10
+                    - Climate risk: {data['climate_risk']['value']}/10
+                    
+                    Demographics:
+                    - Median age: {data['demographics']['median_age']['value']} years
+                    - Household income: ${data['demographics']['household_income']['value']}/week
+                    - Family composition: {data['demographics']['family_composition']}
+                    
+                    Growth Assumptions:
+                    {data['price_projections']['growth_assumptions']}
+                    
+                    Provide comprehensive analysis covering:
+                    1. Key growth drivers and market fundamentals
+                    2. Supply-demand dynamics
+                    3. Infrastructure and location impact
+                    4. Demographic trends and implications
+                    5. Risk assessment and mitigation factors
+                    6. Long-term growth sustainability
+                    Include relevant citations to research and market data.
+                    """
+                }
+            ],
+            #"max_tokens": 123,
+            "temperature": 0.2,
+            #"top_p": 0.9,
+            #"search_domain_filter": None,
+            #"return_images": False,
+            #"return_related_questions": False,
+            #"search_recency_filter": "month",
+            #"top_k": 0,
+            #"stream": False,
+            #"presence_penalty": 0,
+            #"frequency_penalty": 1,
+            #"response_format": None
+        }
+        
+        try:
+            # Log API request details if verbose
+            if verbose:
+                logging.debug(f"\n=== Reasoning API Call for {suburb} ===")
+                logging.debug(f"Request Payload:\n{json.dumps(reasoning_payload, indent=2)}")
+            
+            response = requests.post(PERPLEXITY_API_URL, json=reasoning_payload, headers=HEADERS)
+            response.raise_for_status()
+            
+            # Log API response if verbose
+            if verbose:
+                logging.debug(f"Response Status: {response.status_code}")
+                logging.debug(f"Response Content:\n{response.text}\n")
+            
+            content = response.json()['choices'][0]['message']['content']
+            
+            # Extract reasoning between think tags
+            reasoning_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
+            if reasoning_match:
+                reasoning = reasoning_match.group(1).strip()
+            else:
+                # Fallback to full content if tags not found
+                reasoning = content.strip()
+            
+            # Extract citations array
+            citations_match = re.search(r'citations:\s*(\[.*?\])', content, re.DOTALL)
+            citations = json.loads(citations_match.group(1)) if citations_match else []
+            
+            # Format suburb analysis with clear sections
+            suburb_analysis = f"""
+            {'='*80}
+            Detailed Market Analysis for {suburb} ({data['dwelling_type'].title()} Properties)
+            {'='*80}
+            
+            {reasoning}
+            
+            Research Sources:
+            {chr(10).join(f'- {cite}' for cite in citations)}
+            
+            {'='*80}
+            """
+            
+            all_reasoning.append(suburb_analysis)
+            all_citations.extend(citations)
+            
+            if verbose:
+                logging.debug(f"Successfully generated reasoning for {suburb}")
+                
+        except Exception as e:
+            error_msg = f"Error generating reasoning for {suburb}: {str(e)}"
+            logging.error(error_msg)
+            all_reasoning.append(f"\nError: {error_msg}\n")
+            continue
+    
+    return "\n".join(all_reasoning), list(set(all_citations))
+
 def save_forecast_data(api_data, format='json'):
-    """Save forecast data in selected format"""
+    """Save forecast data in selected format with complete metrics and calculations"""
     export_dir = Path('exports')
     export_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -539,125 +1045,201 @@ def save_forecast_data(api_data, format='json'):
         output_path = f"{base_name}.txt"
         with open(output_path, 'w') as f:
             for suburb, data in data_dict['suburbs'].items():
-                f.write(f"=== {suburb} ===\n")
+                f.write(f"=== {suburb} ===\n\n")
+                
+                # Property Details
+                f.write("Property Details:\n")
                 f.write(f"Median Price: ${data['median_price']['value']:,.2f}\n")
-                f.write(f"Bedrooms: {data['bedrooms']['value']} (Average: {data['default_averages']['bedrooms']['value']})\n")
-                f.write(f"Bathrooms: {data['bathrooms']['value']} (Average: {data['default_averages']['bathrooms']['value']})\n")
-                f.write(f"Car Spaces: {data['car_spaces']['value']} (Average: {data['default_averages']['car_spaces']['value']})\n")
-                f.write(f"Land Size: {data['land_size']['value']} sqm (Average: {data['default_averages']['land_size']['value']})\n")
+                f.write(f"Dwelling Type: {data['dwelling_type']}\n")
+                f.write(f"Bedrooms: {data['bedrooms']['value']}\n")
+                f.write(f"Bathrooms: {data['bathrooms']['value']}\n")
+                f.write(f"Car Spaces: {data['car_spaces']['value']}\n")
+                f.write(f"Land Size: {data['land_size']['value']} sqm\n\n")
+                
+                # Demographics
+                f.write("Demographics:\n")
+                f.write(f"Median Age: {data['demographics']['median_age']['value']} years\n")
+                f.write(f"Household Size: {data['demographics']['household_size']['value']} persons\n")
+                f.write(f"Weekly Household Income: ${data['demographics']['household_income']['value']:,.2f}\n\n")
+                
+                f.write("Family Composition:\n")
+                f.write(f"  Couples with Children: {data['demographics']['family_composition']['couples_with_children']['value']}%\n")
+                f.write(f"  Couples without Children: {data['demographics']['family_composition']['couples_no_children']['value']}%\n")
+                f.write(f"  Single Parent Families: {data['demographics']['family_composition']['single_parent']['value']}%\n\n")
+                
+                f.write("Age Distribution:\n")
+                f.write(f"  Under 35: {data['demographics']['age_distribution']['under_35']['value']}%\n")
+                f.write(f"  35-65: {data['demographics']['age_distribution']['35_to_65']['value']}%\n")
+                f.write(f"  Over 65: {data['demographics']['age_distribution']['over_65']['value']}%\n\n")
+                
+                # Location Metrics
+                f.write("Location Details:\n")
                 f.write(f"Distance to CBD: {data['distance_to_cbd']['value']} km\n")
+                f.write(f"Public Transport Score: {data['public_transport']['value']}/10\n\n")
+                
+                # Commercial Centers
+                f.write("Commercial Centers:\n")
+                f.write("Major Centers:\n")
+                f.write(f"  Count: {data['commercial_centers']['major']['count']}\n")
+                f.write(f"  Average Distance: {data['commercial_centers']['major']['avg_distance']} km\n")
+                f.write(f"  Size Score: {data['commercial_centers']['major']['size_score']['value']}/10\n\n")
+                
+                f.write("Local Centers:\n")
+                f.write(f"  Count: {data['commercial_centers']['local']['count']}\n")
+                f.write(f"  Average Distance: {data['commercial_centers']['local']['avg_distance']} km\n")
+                f.write(f"  Retail Quality: {data['commercial_centers']['local']['retail_quality']['value']}/10\n\n")
+                
+                # Area Features
+                f.write("Area Features:\n")
                 f.write(f"School Quality: {data['school_quality']['value']}/10\n")
                 f.write(f"Infrastructure Score: {data['infrastructure_score']['value']}/10\n")
-                f.write(f"Flood Risk: {data['flood_risk']['value']}/10\n")
-                f.write(f"Population Growth: {data['population_growth']['value']}%\n")
-                f.write(f"Climate Risk: {data['climate_risk']['value']}/10\n")
-                f.write(f"Public Transport: {data['public_transport']['value']}/10\n")
+                f.write(f"Population Growth: {data['population_growth']['value']}%\n\n")
+                
+                # Natural Features
+                f.write("Natural Features:\n")
+                f.write("Water Features:\n")
+                f.write(f"  Distance: {data['water_features']['distance']['value']} km\n")
+                f.write(f"  Type: {data['water_features']['type']}\n")
+                f.write(f"  Premium: {calculate_water_premium(data['water_features']['distance']['value'], data['water_features']['type']):.3f}\n\n")
+                
+                f.write("Parks:\n")
+                f.write(f"  Distance: {data['parks']['distance']['value']} km\n")
+                f.write(f"  Quality: {data['parks']['quality_score']['value']}/10\n")
+                f.write(f"  Premium: {calculate_park_premium(data['parks']['distance']['value'], data['parks']['quality_score']['value']):.3f}\n\n")
+                
+                # Zoning and Risk
+                f.write("Zoning and Risk:\n")
+                f.write("View Protection:\n")
+                f.write(f"  Protected: {data['zoning']['view_protection']['value']}\n")
+                f.write(f"  Height Limit: {data['zoning']['height_restrictions']['value']} m\n")
+                f.write(f"  Premium: {calculate_view_premium(data['zoning']['view_protection']['value'], data['zoning']['height_restrictions']['value']):.3f}\n\n")
+                
+                f.write("Risk Factors:\n")
+                f.write(f"  Flood Risk: {data['flood_risk']['value']}/10\n")
+                f.write(f"  Climate Risk: {data['climate_risk']['value']}/10\n")
+                f.write(f"  Risk Adjustment: {calculate_risk_adjustments(data['flood_risk']['value'], data['climate_risk']['value']):.3f}\n\n")
+                
+                # Market Conditions
+                f.write("Market Conditions:\n")
                 f.write(f"Supply Ratio: {data['supply_ratio']['value']:.2f} (Benchmark: {data['supply_ratio']['benchmark']} months)\n\n")
+                f.write("-" * 80 + "\n\n")
     
-    elif format == 'xlsx':
-        output_path = f"{base_name}.xlsx"
+    elif format == 'xlsx' or format == 'csv':
         df = pd.DataFrame(columns=[
             'Suburb',
+            'Dwelling Type',
             'Median Price (AUD)',
             'Bedrooms',
-            'Average Bedrooms',
             'Bathrooms',
-            'Average Bathrooms',
             'Car Spaces',
-            'Average Car Spaces',
             'Land Size (sqm)',
-            'Average Land Size (sqm)',
             'Distance to CBD (km)',
+            'Major Commercial Count',
+            'Major Commercial Distance (km)',
+            'Major Center Size Score (1-10)',
+            'Local Commercial Count',
+            'Local Commercial Distance (km)',
+            'Retail Quality Score (1-10)',
             'School Quality (1-10)',
             'Infrastructure Score (1-10)',
-            'Flood Risk (1-10)',
             'Population Growth (%)',
-            'Climate Risk (1-10)',
             'Public Transport (1-10)',
             'Supply Ratio',
-            'Supply Benchmark (months)'
+            'Water Distance (km)',
+            'Water Type',
+            'Water Premium',
+            'Park Distance (km)',
+            'Park Quality (1-10)',
+            'Park Premium',
+            'View Protection',
+            'Height Restriction (m)',
+            'View Premium',
+            'Risk Adjustment',
+            'Flood Risk (1-10)',
+            'Climate Risk (1-10)',
+            'Median Age (years)',
+            'Household Size (persons)',
+            'Weekly Household Income (AUD)',
+            'Couples with Children (%)',
+            'Couples No Children (%)',
+            'Single Parent (%)',
+            'Population Under 35 (%)',
+            'Population 35-65 (%)',
+            'Population Over 65 (%)',
+            'Demographic Premium'
         ])
         
         for suburb, data in data_dict['suburbs'].items():
             df = pd.concat([df, pd.DataFrame([{
                 'Suburb': suburb,
+                'Dwelling Type': data['dwelling_type'],
                 'Median Price (AUD)': data['median_price']['value'],
                 'Bedrooms': data['bedrooms']['value'],
-                'Average Bedrooms': data['default_averages']['bedrooms']['value'],
                 'Bathrooms': data['bathrooms']['value'],
-                'Average Bathrooms': data['default_averages']['bathrooms']['value'],
                 'Car Spaces': data['car_spaces']['value'],
-                'Average Car Spaces': data['default_averages']['car_spaces']['value'],
                 'Land Size (sqm)': data['land_size']['value'],
-                'Average Land Size (sqm)': data['default_averages']['land_size']['value'],
                 'Distance to CBD (km)': data['distance_to_cbd']['value'],
+                'Major Commercial Count': data['commercial_centers']['major']['count'],
+                'Major Commercial Distance (km)': data['commercial_centers']['major']['avg_distance'],
+                'Major Center Size Score (1-10)': data['commercial_centers']['major']['size_score']['value'],
+                'Local Commercial Count': data['commercial_centers']['local']['count'],
+                'Local Commercial Distance (km)': data['commercial_centers']['local']['avg_distance'],
+                'Retail Quality Score (1-10)': data['commercial_centers']['local']['retail_quality']['value'],
                 'School Quality (1-10)': data['school_quality']['value'],
                 'Infrastructure Score (1-10)': data['infrastructure_score']['value'],
-                'Flood Risk (1-10)': data['flood_risk']['value'],
                 'Population Growth (%)': data['population_growth']['value'],
-                'Climate Risk (1-10)': data['climate_risk']['value'],
                 'Public Transport (1-10)': data['public_transport']['value'],
                 'Supply Ratio': data['supply_ratio']['value'],
-                'Supply Benchmark (months)': data['supply_ratio']['benchmark']
+                'Water Distance (km)': data['water_features']['distance']['value'],
+                'Water Type': data['water_features']['type'],
+                'Water Premium': calculate_water_premium(
+                    data['water_features']['distance']['value'],
+                    data['water_features']['type']
+                ),
+                'Park Distance (km)': data['parks']['distance']['value'],
+                'Park Quality (1-10)': data['parks']['quality_score']['value'],
+                'Park Premium': calculate_park_premium(
+                    data['parks']['distance']['value'],
+                    data['parks']['quality_score']['value']
+                ),
+                'View Protection': data['zoning']['view_protection']['value'],
+                'Height Restriction (m)': data['zoning']['height_restrictions']['value'],
+                'View Premium': calculate_view_premium(
+                    data['zoning']['view_protection']['value'],
+                    data['zoning']['height_restrictions']['value']
+                ),
+                'Risk Adjustment': calculate_risk_adjustments(
+                    data['flood_risk']['value'],
+                    data['climate_risk']['value']
+                ),
+                'Flood Risk (1-10)': data['flood_risk']['value'],
+                'Climate Risk (1-10)': data['climate_risk']['value'],
+                'Median Age (years)': data['demographics']['median_age']['value'],
+                'Household Size (persons)': data['demographics']['household_size']['value'],
+                'Weekly Household Income (AUD)': data['demographics']['household_income']['value'],
+                'Couples with Children (%)': data['demographics']['family_composition']['couples_with_children']['value'],
+                'Couples No Children (%)': data['demographics']['family_composition']['couples_no_children']['value'],
+                'Single Parent (%)': data['demographics']['family_composition']['single_parent']['value'],
+                'Population Under 35 (%)': data['demographics']['age_distribution']['under_35']['value'],
+                'Population 35-65 (%)': data['demographics']['age_distribution']['35_to_65']['value'],
+                'Population Over 65 (%)': data['demographics']['age_distribution']['over_65']['value'],
+                'Demographic Premium': calculate_demographic_premium(pd.Series({
+                    'population_under_35': data['demographics']['age_distribution']['under_35']['value'],
+                    'population_over_65': data['demographics']['age_distribution']['over_65']['value'],
+                    'couples_with_children': data['demographics']['family_composition']['couples_with_children']['value'],
+                    'couples_no_children': data['demographics']['family_composition']['couples_no_children']['value'],
+                    'household_income': data['demographics']['household_income']['value'],
+                    'household_size': data['demographics']['household_size']['value'],
+                    'dwelling_type': data['dwelling_type']
+                }))
             }])], ignore_index=True)
         
-        df.to_excel(output_path, index=False)
-
-    else:  # csv format
-        output_path = f"{base_name}.csv"
-        with open(output_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            
-            # Define headers with units and ranges
-            headers = [
-                'Suburb',
-                'Median Price (AUD)',
-                'Bedrooms (1-6)',
-                'Bathrooms (1-4)',
-                'Car Spaces (0-3)',
-                'Land Size (sqm)',
-                'Distance To CBD (km)',
-                'School Quality (1-10)',
-                'Infrastructure Score (1-10)',
-                'Flood Risk (1-10)',
-                'Population Growth (% per year)',
-                'Climate Risk (1-10)',
-                'Public Transport (1-10)',
-                'Average Bedrooms (1-6)',
-                'Average Bathrooms (1-4)',
-                'Average Car Spaces (0-3)',
-                'Average Land Size (sqm)',
-                'Supply Ratio',
-                'Supply Benchmark (months)'
-            ]
-            
-            # Write headers
-            writer.writerow(headers)
-            
-            # Write data for each suburb
-            for suburb, suburb_data in data_dict['suburbs'].items():
-                row_data = [
-                    suburb,
-                    suburb_data['median_price']['value'],
-                    suburb_data['bedrooms']['value'],
-                    suburb_data['bathrooms']['value'],
-                    suburb_data['car_spaces']['value'],
-                    suburb_data['land_size']['value'],
-                    suburb_data['distance_to_cbd']['value'],
-                    suburb_data['school_quality']['value'],
-                    suburb_data['infrastructure_score']['value'],
-                    suburb_data['flood_risk']['value'],
-                    suburb_data['population_growth']['value'],
-                    suburb_data['climate_risk']['value'],
-                    suburb_data['public_transport']['value'],
-                    suburb_data['default_averages']['bedrooms']['value'],
-                    suburb_data['default_averages']['bathrooms']['value'],
-                    suburb_data['default_averages']['car_spaces']['value'],
-                    suburb_data['default_averages']['land_size']['value'],
-                    suburb_data['supply_ratio']['value'],
-                    suburb_data['supply_ratio']['benchmark']
-                ]
-                writer.writerow(row_data)
+        if format == 'xlsx':
+            output_path = f"{base_name}.xlsx"
+            df.to_excel(output_path, index=False)
+        else:
+            output_path = f"{base_name}.csv"
+            df.to_csv(output_path, index=False)
     
     return output_path
 
@@ -735,33 +1317,64 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
         )
 
         max_price_input = gr.Number(
-        label="Max Median Price (AUD, optional)",
-        minimum=0,
-        value=None
+            label="Max Median Price (AUD, optional)",
+            minimum=0,
+            value=None
         )
 
-    def process_input(value):
-        """Convert zero values to None for optional inputs"""
-        return None if value == 0 else value
-    
-    def forecast_with_processing(suburbs, bedrooms, bathrooms, car_spaces, land_size, max_price):
-        """Enhanced wrapper function with smart suburb processing"""
-        processed_suburbs = process_suburb_input(suburbs)
-        suburbs_text = '\n'.join(processed_suburbs)
-        
-        return forecast_prices(
-            suburbs_text,
-            process_input(bedrooms),
-            process_input(bathrooms),
-            process_input(car_spaces),
-            process_input(land_size),
-            process_input(max_price)
+    with gr.Row():
+        dwelling_type = gr.Radio(
+            choices=["house", "apartment", "townhouse"],
+            label="Dwelling Type",
+            value="house",
         )
-    
+
     submit_btn = gr.Button("Generate Forecasts", variant="primary")
     
     forecast_gallery = gr.Gallery(label="Price Projections")
+
+    reasoning_output = gr.Textbox(
+        label="Forecast Reasoning",
+        interactive=False,
+        lines=15,
+        max_lines=1000,
+        show_copy_button=True,
+        visible=False
+    )
     
+    with gr.Row():
+        include_reasoning = gr.Checkbox(
+            label="Include Detailed Reasoning",
+            value=False,
+        )
+        txt_btn = gr.Button("Download Reasoning (TXT)")
+        rtf_btn = gr.Button("Download Reasoning (RTF)")
+    
+    def save_reasoning(reasoning: str, format: str) -> str:
+        """Save reasoning to file"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        if format == 'txt':
+            filepath = f'exports/forecast_reasoning_{timestamp}.txt'
+            with open(filepath, 'w') as f:
+                f.write(reasoning)
+        else:
+            filepath = f'exports/forecast_reasoning_{timestamp}.rtf'
+            # Convert to RTF with basic formatting
+            rtf_content = "{\\rtf1\\ansi\n" + reasoning.replace('\n', '\\par\n') + "}"
+            with open(filepath, 'w') as f:
+                f.write(rtf_content)
+        
+        return filepath
+    
+    def update_forecast_display(api_data, verbose):
+        """Update forecast display with reasoning"""
+        if not api_data:
+            return None, gr.update(visible=False)
+        
+        reasoning, citations = generate_forecast_reasoning(json.loads(api_data), verbose)
+        return reasoning, gr.update(visible=True)
+
     api_output = gr.JSON(label="Suburb Data")
     
     export_format = gr.CheckboxGroup(
@@ -772,37 +1385,99 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
 
     export_btn = gr.Button("Export Data")
     
-    export_status = gr.Textbox(
-        label="Export Status", 
-        interactive=False,
-        lines=10,
+    # Unified logging interface
+    logging_output = gr.Textbox(
+        label="Logging", 
+        interactive=False,  # Keep false to prevent user edits
+        lines=10,          # Shows 10 lines at a time
+        max_lines=1000,     # Allows scrolling through up to 1000 lines
+        show_copy_button=True,  # Useful for copying log content
+        autoscroll=True,   # Automatically scrolls to newest logs
         value=""
     )
+
+    # Debug controls
+    with gr.Row():
+        verbose_checkbox = gr.Checkbox(
+            label="Enable Debug Logging",
+            value=False,
+            info="Show verbose output for debugging."
+        )
+    
+    def process_input(value):
+        """Convert zero values to None for optional inputs"""
+        return None if value == 0 else value
+    
+    def forecast_with_processing(suburbs, dwelling_type, bedrooms, bathrooms, car_spaces, 
+                               land_size, max_price, verbose, current_logs, include_reasoning):
+        """Enhanced wrapper with verbose logging integration"""
+        set_verbose(verbose)
+        
+        processed_suburbs = process_suburb_input(suburbs)
+        suburbs_text = '\n'.join(processed_suburbs)
+        
+        plots, api_data = forecast_prices(
+            suburbs_text,
+            dwelling_type,
+            process_input(bedrooms),
+            process_input(bathrooms),
+            process_input(car_spaces),
+            process_input(land_size),
+            process_input(max_price)
+        )
+
+        # Generate reasoning for forecasts
+        reasoning = None
+        if include_reasoning:
+            reasoning = generate_forecast_reasoning(json.loads(api_data), verbose)
+        
+        # Combine existing logs with new API logs
+        logs = textbox_handler.get_logs()
+        if current_logs:
+            logs = current_logs + "\n" + logs
+        
+        return plots, api_data, reasoning, logs
     
     submit_btn.click(
         fn=forecast_with_processing,
         inputs=[
             suburb_input,
+            dwelling_type,
             bedrooms_input,
             bathrooms_input,
             car_spaces_input,
             land_size_input,
-            max_price_input
+            max_price_input,
+            verbose_checkbox,
+            logging_output,
+            include_reasoning
         ],
-        outputs=[forecast_gallery, api_output]
+        outputs=[forecast_gallery, api_output, reasoning_output, logging_output]
     )
     
-    def update_export_status(api_data, formats, current_status):
-        """Update export status while preserving history"""
+    def update_export_status(api_data, formats, current_logs):
+        """Update logging output with export status"""
         new_status = export_data(api_data, formats)
-        if current_status:
-            return current_status + "\n" + new_status
+        if current_logs:
+            return current_logs + "\n" + new_status
         return new_status
     
     export_btn.click(
         fn=update_export_status,
-        inputs=[api_output, export_format, export_status],
-        outputs=export_status
+        inputs=[api_output, export_format, logging_output],
+        outputs=logging_output
+    )
+
+    txt_btn.click(
+        fn=lambda x: save_reasoning(x, 'txt'),
+        inputs=[reasoning_output],
+        outputs=[logging_output]
+    )
+    
+    rtf_btn.click(
+        fn=lambda x: save_reasoning(x, 'rtf'),
+        inputs=[reasoning_output],
+        outputs=[logging_output]
     )
 
 if __name__ == "__main__":
