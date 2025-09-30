@@ -20,6 +20,12 @@ from huggingface_hub import hf_hub_download
 import joblib
 from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
+import warnings
+
+# Suppress sklearn version warnings for model loading
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+warnings.filterwarnings('ignore', message='.*Trying to unpickle estimator.*')
+warnings.filterwarnings('ignore', message='.*loading a serialized model.*')
 
 class TextboxHandler(logging.Handler):
     """Custom logging handler that stores logs for Gradio textbox"""
@@ -112,18 +118,18 @@ def fetch_top_growth_suburbs(state=None, limit=5, max_price=None, retries=3, ver
         set_verbose(verbose)
 
     price_constraint = f"with median prices under ${max_price:,.0f} " if max_price else ""
-    
+
     payload = {
         "model": "sonar-pro",
         "messages": [
             {
-                "role": "system", 
+                "role": "system",
                 "content": "You are an expert Australian real estate analyst. Return only a clean JSON array of suburb strings without any additional text or reasoning."
             },
             {
                 "role": "user",
                 "content": f"Return a JSON array of exactly {limit} top Australian growth suburbs" +
-                          "for the last 12 months " +
+                          "for the last 6 months " +
                           (f"in {state} " if state else "in Australia ") +
                           price_constraint +
                           "based on projected 5-year growth rate. " +
@@ -136,9 +142,9 @@ def fetch_top_growth_suburbs(state=None, limit=5, max_price=None, retries=3, ver
 
     for attempt in range(retries):
         try:
-            response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS)
+            response = requests.post(PERPLEXITY_API_URL, json=payload, headers=HEADERS, timeout=600)
             response.raise_for_status()
-            
+
             logging.debug(f"State: {state if state else 'All Australia'}")
             logging.debug(f"Limit: {limit}")
             logging.debug(f"Max Price: {max_price if max_price else 'No limit'}")
@@ -147,11 +153,15 @@ def fetch_top_growth_suburbs(state=None, limit=5, max_price=None, retries=3, ver
 
             data = response.json()
             content = data['choices'][0]['message']['content']
-            
+
+            # Handle <think> section if present
+            if '</think>' in content:
+                content = content.split('</think>')[-1].strip()
+
             json_start = content.find('[')
             json_end = content.rfind(']') + 1
             json_str = content[json_start:json_end]
-            
+
             suburbs = json.loads(json_str)
             return suburbs[:limit]
 
@@ -214,10 +224,138 @@ def process_suburb_input(suburb_text, max_price=None):
     # Return exact suburbs provided without fetching additional ones
     return input_lines
 
+def extract_valid_json(response_content: str) -> dict:
+    """
+    Extracts and returns only the valid JSON part from a response content string.
+
+    This function handles potential extra text or markdown and extracts clean JSON.
+
+    Parameters:
+        response_content (str): The content string from the API response.
+
+    Returns:
+        dict: The parsed JSON object extracted from the content.
+
+    Raises:
+        ValueError: If no valid JSON can be parsed from the content.
+    """
+    # Try to find JSON directly first (sonar-pro doesn't use <think> tags)
+    # But keep support for <think> tags if they appear
+    marker = "</think>"
+    idx = response_content.rfind(marker)
+
+    if idx == -1:
+        # If marker not found, try parsing the entire content.
+        # First, remove markdown code fences if present
+        content_to_parse = response_content.strip()
+
+        if content_to_parse.startswith("```json"):
+            content_to_parse = content_to_parse[7:].strip()
+        elif content_to_parse.startswith("```"):
+            content_to_parse = content_to_parse[3:].strip()
+
+        if content_to_parse.endswith("```"):
+            content_to_parse = content_to_parse[:-3].strip()
+
+        # Remove any trailing explanation text after JSON
+        # Look for common separators
+        separators = ['\n- ', '\n\n', '\nNote:', '\nAll values']
+        for sep in separators:
+            if sep in content_to_parse:
+                # Find where JSON likely ends
+                brace_count = 0
+                for i, char in enumerate(content_to_parse):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # This is likely the end of JSON
+                            content_to_parse = content_to_parse[:i+1]
+                            break
+
+        try:
+            # Try to find JSON boundaries
+            json_start = content_to_parse.find('{')
+            json_end = content_to_parse.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                json_str = content_to_parse[json_start:json_end]
+            else:
+                json_str = content_to_parse
+
+            # Fix invalid JSON: Remove underscores from numbers (e.g., 1_299_000 -> 1299000)
+            # This is a workaround for Perplexity API sometimes returning numbers with underscores
+            json_str = re.sub(r'(\d)_(\d)', r'\1\2', json_str)
+
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logging.error(f"No </think> marker found. Response preview: {response_content[:500]}")
+            raise ValueError("No </think> marker found and content is not valid JSON") from e
+
+    # Extract the substring after the marker.
+    json_str = response_content[idx + len(marker):].strip()
+
+    # Remove markdown code fence markers if present (must be done before JSON parsing)
+    # Handle both with and without language specifier
+    if json_str.startswith("```json"):
+        json_str = json_str[7:].strip()  # Remove ```json
+    elif json_str.startswith("```"):
+        json_str = json_str[3:].strip()  # Remove ```
+
+    if json_str.endswith("```"):
+        json_str = json_str[:-3].strip()  # Remove closing ```
+
+    # Try to extract JSON object or array
+    if not json_str:
+        logging.error(f"Empty string after </think> marker. Full response: {response_content[:1000]}")
+        raise ValueError("Empty content after </think> marker")
+
+    # Find JSON boundaries more robustly - find first complete JSON object
+    json_start = json_str.find('{')
+    if json_start == -1:
+        json_start = json_str.find('[')
+
+    if json_start != -1:
+        json_str = json_str[json_start:]
+
+        # Fix invalid JSON: Remove underscores from numbers (e.g., 1_299_000 -> 1299000)
+        json_str = re.sub(r'(\d)_(\d)', r'\1\2', json_str)
+
+        # Use a decoder to find the end of the first valid JSON object
+        decoder = json.JSONDecoder()
+        try:
+            parsed_json, end_idx = decoder.raw_decode(json_str)
+            return parsed_json
+        except json.JSONDecodeError:
+            # If that fails, try the old method
+            if json_str[0] == '{':
+                # Count braces to find matching closing brace
+                brace_count = 0
+                for i, char in enumerate(json_str):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_str = json_str[:i+1]
+                            break
+            else:
+                json_end = json_str.rfind(']') + 1
+                if json_end > 0:
+                    json_str = json_str[:json_end]
+
+    try:
+        parsed_json = json.loads(json_str)
+        return parsed_json
+    except json.JSONDecodeError as e:
+        logging.error(f"JSON decode error. Extracted string: {json_str[:500]}")
+        logging.error(f"Full response content: {response_content[:1000]}")
+        raise ValueError(f"Failed to parse valid JSON from response content: {str(e)}") from e
+
 def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None, verbose: Optional[bool] = None):
     """
     Fetch suburb data with property type specifications and inflation metrics
-    
+
     Parameters:
         suburbs (str): Newline-separated list of suburbs
         dwelling_type (str): Type of property (house, apartment, townhouse)
@@ -256,7 +394,7 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                                     "bathrooms": {{ "value": (average number), "range": "1-4" }},
                                     "car_spaces": {{ "value": (average number), "range": "0-3" }},
                                     "land_size": {{ "value": (average size), "unit": "sqm" }},
-                                    "inflation": {{ 
+                                    "inflation": {{
                                         "current": {{ "value": (rate), "unit": "percent" }},
                                         "forecast": {{ "value": (rate), "unit": "percent" }},
                                         "volatility": {{ "value": (rate), "unit": "percent" }}
@@ -266,18 +404,13 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                         ],
                         "temperature": 0.0
                     }
-                    
-                    default_response = requests.post(PERPLEXITY_API_URL, json=default_payload, headers=HEADERS)
+
+                    default_response = requests.post(PERPLEXITY_API_URL, json=default_payload, headers=HEADERS, timeout=600)
                     default_response.raise_for_status()
                     default_content = default_response.json()['choices'][0]['message']['content']
 
-                    # strip CoT
-                    if '<think>' in default_content:
-                        default_content = default_content.split('```json')[1].split('```')[0]
-
-                    default_json_start = default_content.find('{')
-                    default_json_end = default_content.rfind('}') + 1
-                    default_data = json.loads(default_content[default_json_start:default_json_end])
+                    # Parse JSON with <think> section handling
+                    default_data = extract_valid_json(default_content)
                     log_api_response(suburb, default_payload, default_response)
 
                     # Get housing inventory data
@@ -297,10 +430,11 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                         "temperature": 0.0
                     }
 
-                    inventory_response = requests.post(PERPLEXITY_API_URL, json=inventory_payload, headers=HEADERS)
+                    inventory_response = requests.post(PERPLEXITY_API_URL, json=inventory_payload, headers=HEADERS, timeout=600)
                     inventory_response.raise_for_status()
                     inventory_content = inventory_response.json()['choices'][0]['message']['content']
-                    inventory_months = float(inventory_content)
+                    # Extract number from response
+                    inventory_months = float(re.search(r'\d+\.?\d*', inventory_content).group())
 
                     supply_ratio = np.where(
                         inventory_months < 1.5,
@@ -335,7 +469,7 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                             {
                                 "role": "system",
                                 "content": "You are an expert Australian real estate analyst. Return only a JSON object with numerical values and their units/ranges." +
-                                    "Only use data published in the last 12 months. "
+                                    "Only use data published in the last 6 months. "
                             },
                             {
                                 "role": "user",
@@ -407,17 +541,47 @@ def fetch_suburb_data(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None
                         "temperature": 0.0
                     }
 
-                    response = requests.post(PERPLEXITY_API_URL, json=suburb_payload, headers=HEADERS)
+                    response = requests.post(PERPLEXITY_API_URL, json=suburb_payload, headers=HEADERS, timeout=600)
                     response.raise_for_status()
-                    content = response.json()['choices'][0]['message']['content']
 
-                    # strip CoT
-                    if '<think>' in content:
-                        content = content.split('```json')[1].split('```')[0]
+                    # Get response and validate structure
+                    response_json = response.json()
+                    if 'choices' not in response_json or not response_json['choices']:
+                        print(f"Error for {suburb}: Invalid response structure - no 'choices' field")
+                        print(f"Response keys: {response_json.keys()}")
+                        continue
 
-                    json_start = content.find('{')
-                    json_end = content.rfind('}') + 1
-                    suburb_data = json.loads(content[json_start:json_end])
+                    if 'message' not in response_json['choices'][0]:
+                        print(f"Error for {suburb}: Invalid response structure - no 'message' field")
+                        print(f"Choice keys: {response_json['choices'][0].keys()}")
+                        continue
+
+                    content = response_json['choices'][0]['message']['content']
+
+                    # Parse JSON with <think> section handling
+                    try:
+                        suburb_data = extract_valid_json(content)
+                    except (ValueError, json.JSONDecodeError) as e:
+                        error_msg = f"Failed to extract JSON for {suburb}: {str(e)}"
+                        print(error_msg)
+
+                        # Save failed response to file for debugging
+                        debug_dir = Path('./debug_responses')
+                        debug_dir.mkdir(exist_ok=True)
+                        debug_file = debug_dir / f"{suburb.replace(' ', '_').replace(',', '')}_response.txt"
+                        try:
+                            with open(debug_file, 'w', encoding='utf-8') as f:
+                                f.write(f"Suburb: {suburb}\n")
+                                f.write(f"Error: {str(e)}\n")
+                                f.write(f"\n{'='*80}\n")
+                                f.write(f"Full Response:\n")
+                                f.write(content)
+                            print(f"Debug response saved to {debug_file}")
+                        except Exception as file_err:
+                            print(f"Failed to save debug file: {file_err}")
+
+                        continue  # Skip this suburb and try the next one
+
                     log_api_response(suburb, suburb_payload, response)
                    
                     # Add supply ratio and inflation data
@@ -1219,6 +1383,18 @@ def generate_forecast_reasoning(df: pd.DataFrame, api_data: str, verbose: bool =
     
     for _, row in df.iterrows():
         suburb = row['suburb']
+
+        # Skip suburbs that don't have data (failed to fetch)
+        if suburb not in data_dict.get('suburbs', {}):
+            logging.warning(f"Skipping reasoning for {suburb} - no data available")
+            all_reasoning.append(f"""
+## Market Analysis: {suburb}
+Unable to generate analysis - suburb data not available.
+
+---
+""")
+            continue
+
         projections = data_dict['suburbs'][suburb]['price_projections']
         
         years = projections['years']
@@ -1238,7 +1414,7 @@ def generate_forecast_reasoning(df: pd.DataFrame, api_data: str, verbose: bool =
         ]
         
         reasoning_payload = {
-            "model": "sonar-reasoning-pro",
+            "model": "sonar-pro",
             "messages": [
                 {
                     "role": "system",
@@ -1339,7 +1515,7 @@ def generate_forecast_reasoning(df: pd.DataFrame, api_data: str, verbose: bool =
         }
         
         try:
-            response = requests.post(PERPLEXITY_API_URL, json=reasoning_payload, headers=HEADERS)
+            response = requests.post(PERPLEXITY_API_URL, json=reasoning_payload, headers=HEADERS, timeout=600)
             response.raise_for_status()
 
             if verbose:

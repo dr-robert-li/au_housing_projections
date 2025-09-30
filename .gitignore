@@ -1,6 +1,8 @@
 # Project-specific directories
 exports/
 forecasts/
+debug_responses/
+test_output/
 
 # Environment
 .env
@@ -29,12 +31,14 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+test*
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+.claude/
 
 # OS
 .DS_Store
