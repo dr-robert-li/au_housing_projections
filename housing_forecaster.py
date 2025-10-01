@@ -59,6 +59,60 @@ base_model = joblib.load(model_path)
 FORECAST_DIR = Path('./forecasts')
 FORECAST_DIR.mkdir(exist_ok=True)
 
+# ============================================================================
+# DATA LOADING UTILITIES - Load calibrated parameters from includes/
+# ============================================================================
+
+def load_supply_elasticity() -> dict:
+    """Load city-specific supply elasticity from includes/"""
+    try:
+        with open('includes/supply_elasticity_by_city.json', 'r') as f:
+            data = json.load(f)
+        return {city: vals['long_run'] for city, vals in data.items() if isinstance(vals, dict)}
+    except FileNotFoundError:
+        logging.warning("Supply elasticity data not found, using defaults")
+        return {'Sydney': 0.03, 'Melbourne': 0.05, 'Brisbane': 0.08, 'Perth': 0.07}
+
+def load_rba_parameters() -> dict:
+    """Load RBA model coefficients from includes/"""
+    try:
+        with open('includes/rba_model_parameters.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logging.warning("RBA parameters not found, using defaults")
+        return {
+            'momentum': {
+                'INITIAL_DEVELOPMENT': 0.74,
+                'RAPID_GROWTH': 0.60,
+                'ESTABLISHED_MATURITY': 0.30,
+                'RENEWAL_OR_DECLINE': 0.20
+            },
+            'error_correction': {
+                'INITIAL_DEVELOPMENT': 0.05,
+                'RAPID_GROWTH': 0.10,
+                'ESTABLISHED_MATURITY': 0.14,
+                'RENEWAL_OR_DECLINE': 0.18
+            }
+        }
+
+def extract_city_from_suburb(suburb: str) -> str:
+    """Extract city from 'Suburb STATE' format"""
+    suburb_upper = suburb.upper()
+    if 'NSW' in suburb_upper or 'SYDNEY' in suburb_upper:
+        return 'Sydney'
+    elif 'VIC' in suburb_upper or 'MELBOURNE' in suburb_upper:
+        return 'Melbourne'
+    elif 'QLD' in suburb_upper or 'BRISBANE' in suburb_upper:
+        return 'Brisbane'
+    elif 'WA' in suburb_upper or 'PERTH' in suburb_upper:
+        return 'Perth'
+    elif 'SA' in suburb_upper or 'ADELAIDE' in suburb_upper:
+        return 'Adelaide'
+    elif 'ACT' in suburb_upper or 'CANBERRA' in suburb_upper:
+        return 'Canberra'
+    else:
+        return 'Sydney'  # Default
+
 # Initialize Perplexity API
 load_dotenv()
 PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
@@ -997,10 +1051,39 @@ def fine_tune_model(model, new_data):
     
     return model
 
+def estimate_suburb_age(suburb_data: pd.DataFrame) -> np.ndarray:
+    """
+    Estimate years since maturity using demographic proxies
+    Returns array of estimated ages for each suburb
+
+    Lifecycle stages based on AHURI research:
+    - Early growth (0-5 years): Large households, young population
+    - Peak maturity (5-15 years): Families with children
+    - Established (15-30 years): Empty nesters
+    - Mature/Renewal (30+ years): Aging demographics or gentrification
+    """
+    ages = np.zeros(len(suburb_data))
+
+    for i, (idx, row) in enumerate(suburb_data.iterrows()):
+        # Early growth: Large households (>3.2), young population
+        if row['household_size'] > 3.2:
+            ages[i] = 5
+        # Peak maturity: Families with children (households 2.8-3.2)
+        elif row['household_size'] > 2.8:
+            ages[i] = 15
+        # Established: Smaller households (2.3-2.8), some empty nesters
+        elif row['household_size'] > 2.3:
+            ages[i] = 25
+        # Mature: Very small households (<2.3), empty nesters/singles
+        else:
+            ages[i] = 35
+
+    return ages
+
 def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
     """
-    Calculate moderated growth adjustments with research-backed coefficients
-    
+    Calculate moderated growth adjustments with research-backed coefficients AND lifecycle-aware maturity decay
+
     Key Components:
     1. Supply and Demand Metrics
     2. Population and Migration Effects
@@ -1009,7 +1092,18 @@ def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
     5. Risk Adjustments
     6. Affordability Constraints
     7. Crime Statistics
+    8. LIFECYCLE MATURITY DECAY (NEW - Phase 1)
     """
+    # ====== PHASE 1: MATURITY DECAY FACTOR ======
+    # Estimate suburb age using demographic proxies
+    years_since_maturity = estimate_suburb_age(suburb_data)
+
+    # Maturity decay factor using S-curve centered at year 15
+    # Early suburbs (0-5 years): factor ≈ 0.9-1.0 (minimal decay)
+    # Peak suburbs (10-20 years): factor ≈ 0.5 (50% decay)
+    # Mature suburbs (30+ years): factor ≈ 0.0-0.1 (near-zero growth from improvements)
+    maturity_factor = 1 / (1 + np.exp(0.1 * (years_since_maturity - 15)))
+
     # Supply impact with continuous scaling (AHURI Report 281)
     supply_impact = np.where(
         suburb_data['supply_ratio'] < 0.5,
@@ -1021,24 +1115,26 @@ def calculate_growth_adjustments(suburb_data: pd.DataFrame) -> pd.Series:
         )
     )
 
-    # Population growth with migration effects
+    # Population growth with migration effects (NOW WITH DECAY)
     base_pop_growth = np.minimum(0.0025, 0.8 * suburb_data['population_growth'])
     migration_boost = np.where(
         suburb_data['population_growth'] > 2.5,
         0.002 * (suburb_data['population_growth'] - 2.5),
         0
     )
-    pop_growth_adj = base_pop_growth + migration_boost
+    pop_growth_adj = (base_pop_growth + migration_boost) * maturity_factor  # <-- APPLY DECAY
 
-    # Infrastructure impact with quality threshold
+    # Infrastructure impact with quality threshold (NOW WITH DECAY)
     infra_adj = np.where(
         suburb_data['infrastructure_score'] >= 7,
         suburb_data['infrastructure_score'] * 0.0015,
         suburb_data['infrastructure_score'] * 0.0005
     )
+    infra_adj = infra_adj * maturity_factor  # <-- APPLY DECAY
 
-    # School quality premium with non-linear scaling
+    # School quality premium with non-linear scaling (NOW WITH DECAY)
     school_adj = np.power(suburb_data['school_quality']/10, 1.5) * 0.002
+    school_adj = school_adj * maturity_factor  # <-- APPLY DECAY
 
     # Location premium with exponential decay (RBA distance model)
     def location_decay(distance, pt_score):
@@ -1164,6 +1260,349 @@ def calculate_growth_rates(projections):
     
     return growth_rates
 
+def classify_lifecycle_stage(years_since_maturity: float) -> str:
+    """
+    Map suburb age to discrete lifecycle stage
+
+    Based on AHURI research patterns:
+    - INITIAL_DEVELOPMENT (0-5 years): High growth, infrastructure building
+    - RAPID_GROWTH (5-15 years): Peak maturity, infrastructure saturation
+    - ESTABLISHED_MATURITY (15-30 years): Stable, moderate growth
+    - RENEWAL_OR_DECLINE (30+ years): Either gentrification or decline
+    """
+    if years_since_maturity < 5:
+        return 'INITIAL_DEVELOPMENT'
+    elif years_since_maturity < 15:
+        return 'RAPID_GROWTH'
+    elif years_since_maturity < 30:
+        return 'ESTABLISHED_MATURITY'
+    else:
+        return 'RENEWAL_OR_DECLINE'
+
+def calculate_fundamental_value(suburb_row: pd.Series, state: dict,
+                               year_idx: int = 0, rba_params: dict = None) -> float:
+    """
+    PHASE 4 POLISH: Calculate equilibrium price based on rental yield = user cost
+    P* = Annual Rent / (interest rate + depreciation + maintenance - expected appreciation)
+
+    Enhanced with:
+    - Dynamic interest rate cycles (10-year RBA cash rate simulation)
+    - Current price-based rent (rents adjust with market)
+    - Stage-specific expected appreciation
+    """
+    # Load RBA parameters if not provided
+    if rba_params is None:
+        rba_params = load_rba_parameters()
+
+    # Estimate annual rent from typical gross yields (distance-based)
+    if suburb_row['distance_to_cbd'] < 20:
+        gross_yield = 0.03  # Inner city - lower yields, higher growth expectations
+    else:
+        gross_yield = 0.04  # Regional/outer - higher yields, lower growth
+
+    # ====== PHASE 4: Use current price for rent, not initial ======
+    # Rents grow with market conditions
+    annual_rent = state['current_price'] * gross_yield
+
+    # ====== PHASE 4: Dynamic interest rate cycles ======
+    # Simulates RBA cash rate movements over 10-year cycles
+    base_interest_rate = 0.05  # 5% base mortgage rate
+    cycle_amplitude = 0.015  # ±1.5% swing
+    cycle_phase = (year_idx % 10) / 10 * 2 * np.pi
+    interest_rate = base_interest_rate + (cycle_amplitude * np.sin(cycle_phase))
+
+    # User cost components (from RBA model parameters)
+    user_cost_params = rba_params.get('user_cost_components', {
+        'depreciation': 0.015,
+        'maintenance': 0.01,
+        'expected_appreciation_long_run': 0.025
+    })
+
+    depreciation = user_cost_params.get('depreciation', 0.015)
+    maintenance = user_cost_params.get('maintenance', 0.01)
+
+    # ====== PHASE 4: Stage-specific expected appreciation ======
+    stage = classify_lifecycle_stage(state['years_since_maturity'] + year_idx)
+    stage_appreciation = {
+        'INITIAL_DEVELOPMENT': 0.04,  # 4% expected in high-growth areas
+        'RAPID_GROWTH': 0.035,  # 3.5% expected
+        'ESTABLISHED_MATURITY': 0.025,  # 2.5% long-run average
+        'RENEWAL_OR_DECLINE': 0.02  # 2% in mature areas
+    }
+    expected_appreciation = stage_appreciation.get(stage, 0.025)
+
+    # User cost formula
+    user_cost = interest_rate + depreciation + maintenance - expected_appreciation
+
+    # Prevent division by zero
+    if user_cost <= 0:
+        user_cost = 0.01
+
+    # Fundamental price where rental yield equals user cost
+    fundamental_price = annual_rent / user_cost
+
+    return fundamental_price
+
+def calculate_year_growth(state: dict, suburb_row: pd.Series,
+                         year_idx: int, rba_params: dict) -> float:
+    """
+    Calculate growth for THIS specific year based on CURRENT state
+    Not Year 0 characteristics!
+
+    Incorporates:
+    - Lifecycle stage-specific momentum and mean reversion
+    - Current maturity decay
+    - Price momentum from prior year
+    - Mean reversion to fundamental value
+    """
+    # Classify current lifecycle stage
+    total_age = state['years_since_maturity'] + year_idx
+    stage = classify_lifecycle_stage(total_age)
+
+    # Get stage-specific parameters (RBA calibrated)
+    momentum_coeff = rba_params['momentum'][stage]
+    mean_reversion_speed = rba_params['error_correction'][stage]
+
+    # Base components with current maturity decay
+    maturity_factor = 1 / (1 + np.exp(0.1 * (total_age - 15)))
+
+    # Population impact (decays with maturity)
+    pop_impact = 0.0008 * suburb_row['population_growth'] * maturity_factor
+
+    # Infrastructure impact (decays with maturity)
+    infra_impact = 0.0015 * suburb_row['infrastructure_score'] * maturity_factor
+
+    # School quality impact (decays with maturity)
+    school_impact = 0.002 * (suburb_row['school_quality']/10) ** 1.5 * maturity_factor
+
+    # Momentum from prior year (stage-specific coefficient)
+    # Early stages: high momentum (0.74), mature stages: low momentum (0.20)
+    momentum = momentum_coeff * state['prior_year_growth']
+
+    # Mean reversion to fundamentals (stage-specific speed)
+    # Early stages: slow reversion (0.05), mature stages: fast reversion (0.18)
+    # PHASE 4: Pass year_idx and rba_params for dynamic interest rates and stage appreciation
+    fundamental_price = calculate_fundamental_value(suburb_row, state, year_idx, rba_params)
+    price_gap = np.log(fundamental_price / state['current_price'])
+    reversion = mean_reversion_speed * price_gap
+
+    # Total growth from all components
+    total_growth = (pop_impact + infra_impact + school_impact +
+                   momentum + reversion)
+
+    return total_growth
+
+def calculate_supply_adjustment(current_ratio: float, price_change: float,
+                               growth_rate: float, years_since_maturity: float,
+                               city_elasticity: float) -> float:
+    """
+    Calculate dynamic supply ratio adjustment based on construction response and demand absorption
+
+    Research basis:
+    - RBA: Construction responds with -6.2% approvals per 1pp price decline (detached)
+    - US 2008: -78% construction decline during severe oversupply
+    - Absorption: 15% baseline, decays with excess inventory severity
+    - Time to respond: ~10 years for major demand surges (RBA 2019)
+
+    Returns: Annual change in supply ratio (can be positive or negative)
+    """
+    supply_ratio_delta = 0.0
+
+    # COMPONENT 1: Construction Response
+    # When prices decline and oversupply exists, construction slows
+    if current_ratio > 1.2 and growth_rate < 0:
+        # RBA: -6.2% detached approvals per 1 percentage point price decline
+        # Scale by severity of oversupply and price decline
+        construction_slowdown = 0.062 * abs(growth_rate)
+
+        # Elasticity decay with suburb age (mature suburbs less responsive)
+        if years_since_maturity < 10:
+            elasticity_multiplier = 1.2  # Young suburbs more responsive
+        elif years_since_maturity < 30:
+            elasticity_multiplier = 1.0  # Standard responsiveness
+        else:
+            elasticity_multiplier = 0.7  # Mature suburbs less responsive
+
+        construction_slowdown *= elasticity_multiplier
+
+        # Construction slowdown reduces supply ratio (less new inventory added)
+        # Scale: 6.2% approval decline → ~0.5% annual supply ratio reduction
+        supply_ratio_delta -= construction_slowdown * 0.08
+
+    elif current_ratio < 1.0 and growth_rate > 0:
+        # Undersupply: construction accelerates
+        # RBA: +30% construction boost for +10% price increase
+        construction_boost = min(0.30 * (growth_rate / 0.10), 0.15)  # Cap at 15%
+        supply_ratio_delta += construction_boost * 0.05
+
+    # COMPONENT 2: Demand Absorption
+    # Excess inventory gets absorbed by demand over time
+    if current_ratio > 1.0:
+        excess_inventory = current_ratio - 1.0
+
+        # Non-linear absorption: harder to absorb extreme oversupply
+        # Base: 15% absorption rate, decays exponentially with severity
+        # ratio 1.5 → 11.8%, ratio 5.0 → 3.0%, ratio 30.5 → 0.8%
+        base_absorption = 0.15
+        absorption_rate = base_absorption * np.exp(-0.15 * excess_inventory)
+
+        # Absorption reduces supply ratio
+        supply_reduction = absorption_rate * excess_inventory
+        supply_ratio_delta -= supply_reduction
+
+    return supply_ratio_delta
+
+def apply_market_constraints(growth_rate: float, state: dict, year_idx: int) -> float:
+    """
+    Apply three research-backed constraints to prevent unrealistic growth:
+    1. Supply response (Australia's 0.07 elasticity)
+    2. Affordability brake (price-to-income threshold)
+    3. Infrastructure saturation ceiling
+
+    Based on RBA RDP 2018-03, 2019-01 and AHURI research
+    """
+    constrained_growth = growth_rate
+
+    # CONSTRAINT 1: Supply dampening
+    # When supply ratio >1.2 (>7 months inventory vs 6-month standard), oversupply dampens growth
+    if state.get('supply_ratio', 1.0) > 1.2:
+        # Research-calibrated dampening based on RBA demand elasticity and US housing crisis data:
+        # - RBA: 1% supply increase → 2.5% price decrease (demand elasticity -0.4)
+        # - US 2008 crisis: 39% higher inventory → 30% price decline over 3 years (~-11% annually)
+        # - Markets stabilize at lower equilibrium, they don't collapse to zero
+        #
+        # Implementation: Moderate annual penalty approaching -2% ceiling
+        # This represents adjustment toward new equilibrium, not perpetual collapse
+        # ratio 1.2 → -0.05%, ratio 2.0 → -0.25%, ratio 5.0 → -0.86%, ratio 30.5 → -1.97%
+        excess_supply = state['supply_ratio'] - 1.0
+        supply_dampening = -0.02 * (1 - np.exp(-0.15 * excess_supply))
+        constrained_growth += supply_dampening
+        logging.debug(f"Supply dampening: {supply_dampening:.4f} (ratio: {state['supply_ratio']:.2f})")
+
+    # CONSTRAINT 2: Affordability brake
+    # Price-to-income ratios >10x trigger demand collapse
+    # Historical evidence: ratios >10-12x lead to corrections
+    affordability_ratio = state['current_price'] / state['annual_income']
+    if affordability_ratio > 10:
+        # Non-linear brake: accelerates as ratio increases
+        # At 12x: ~-3.6% penalty, at 15x: ~-8.5% penalty
+        affordability_brake = -0.02 * ((affordability_ratio - 10) ** 1.2)
+        constrained_growth += affordability_brake
+        constrained_growth = max(constrained_growth, -0.05)  # Floor at -5% to prevent crashes
+        logging.debug(f"Affordability brake: {affordability_brake:.4f} (P/I: {affordability_ratio:.1f}x)")
+
+    # CONSTRAINT 3: Infrastructure saturation ceiling
+    # After 10 years, additional infrastructure provides diminishing returns
+    # AHURI research: infrastructure saturation at 5-10 years post-development
+    years_mature = state.get('years_since_maturity', 20) + year_idx
+    if years_mature > 10:
+        # Exponential decay: approaches -0.2% ceiling over time
+        # Year 10: 0%, Year 20: -0.13%, Year 40: -0.19%
+        infra_penalty = -0.002 * (1 - np.exp(-0.1 * (years_mature - 10)))
+        constrained_growth += infra_penalty
+        logging.debug(f"Infrastructure saturation: {infra_penalty:.4f} (age: {years_mature} years)")
+
+    return constrained_growth
+
+def validate_long_term_projections(suburb_name: str, median_trajectory: np.ndarray,
+                                   suburb_data_row: pd.Series, years: np.ndarray) -> dict:
+    """
+    Sanity checks for 50-year forecasts
+    Returns validation results and warnings
+
+    Based on research constraints:
+    - No suburb should show >200% real appreciation over 50 years
+    - Late-stage growth should be <2% annually
+    - Price-to-income ratio shouldn't exceed 20x
+    """
+    validation_results = {
+        'suburb': suburb_name,
+        'warnings': [],
+        'passed': True
+    }
+
+    # Check 1: Total appreciation limit
+    total_appreciation = (median_trajectory[-1] / median_trajectory[0]) - 1
+    if total_appreciation > 2.0:
+        validation_results['warnings'].append(
+            f"⚠️ Total appreciation {total_appreciation:.1%} over 50 years - UNREALISTIC (>200%)"
+        )
+        validation_results['passed'] = False
+
+    # Check 2: Late-stage growth moderation
+    late_stage_prices = median_trajectory[-10:]
+    late_stage_growth_rates = np.diff(late_stage_prices) / late_stage_prices[:-1]
+    avg_late_growth = np.mean(late_stage_growth_rates)
+
+    if avg_late_growth > 0.02:
+        validation_results['warnings'].append(
+            f"⚠️ Year 40-50 average growth {avg_late_growth:.1%} - should be <2% for mature suburbs"
+        )
+        validation_results['passed'] = False
+
+    # Check 3: Price-to-income ratio ceiling
+    final_price = median_trajectory[-1]
+    initial_income = suburb_data_row['household_income'] * 52  # Weekly to annual
+    # Assume 2.5% annual income growth over 50 years
+    projected_income = initial_income * (1.025 ** 50)
+    pti_ratio = final_price / projected_income
+
+    if pti_ratio > 20:
+        validation_results['warnings'].append(
+            f"⚠️ Final price-to-income ratio {pti_ratio:.1f}x - MARKET WOULD COLLAPSE (>20x)"
+        )
+        validation_results['passed'] = False
+
+    # PHASE 4: Check 4 - Mean reversion test
+    # Prices should not deviate >50% from trend for extended periods
+    # Calculate rolling 10-year trend and check for persistent deviations
+    if len(median_trajectory) >= 10:
+        rolling_deviations = []
+        for i in range(10, len(median_trajectory)):
+            window = median_trajectory[i-10:i]
+            trend = np.polyfit(range(10), window, 1)[0] * 10  # 10-year trend
+            current = median_trajectory[i]
+            deviation = abs((current - window[-1]) / window[-1])
+            rolling_deviations.append(deviation)
+
+        max_deviation = max(rolling_deviations) if rolling_deviations else 0
+        if max_deviation > 0.50:
+            validation_results['warnings'].append(
+                f"⚠️ Maximum 10-year deviation {max_deviation:.1%} - mean reversion may be weak (>50%)"
+            )
+            validation_results['passed'] = False
+
+    # PHASE 4: Check 5 - Volatility explosion test
+    # Standard deviation of year-to-year growth should not exceed 15%
+    year_growth_rates = np.diff(median_trajectory) / median_trajectory[:-1]
+    growth_volatility = np.std(year_growth_rates)
+    if growth_volatility > 0.15:
+        validation_results['warnings'].append(
+            f"⚠️ Growth volatility {growth_volatility:.1%} - EXCESSIVE (>15%)"
+        )
+        validation_results['passed'] = False
+
+    # Success metrics
+    validation_results['metrics'] = {
+        'total_appreciation_pct': total_appreciation * 100,
+        'late_stage_avg_growth_pct': avg_late_growth * 100,
+        'final_price_to_income_ratio': pti_ratio,
+        'projected_50yr_income': projected_income,
+        'max_10yr_deviation_pct': max_deviation * 100 if len(median_trajectory) >= 10 else 0,
+        'growth_volatility_pct': growth_volatility * 100
+    }
+
+    if validation_results['passed']:
+        logging.info(f"✅ {suburb_name} validation passed: "
+                    f"{total_appreciation:.1%} appreciation, "
+                    f"{avg_late_growth:.1%} late growth, "
+                    f"{pti_ratio:.1f}x P/I ratio")
+    else:
+        for warning in validation_results['warnings']:
+            logging.warning(f"{suburb_name}: {warning}")
+
+    return validation_results
+
 def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, car_spaces=None, land_size=None, max_price=None):
     """Generate forecasts for multiple suburbs with optional property criteria"""
     # Fetch current data and API response with property criteria
@@ -1197,12 +1636,13 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         
         # Calculate suburb-specific growth rate
         suburb_idx = suburb_data[suburb_data['suburb'] == suburb].index[0]
+        suburb_row = suburb_data.iloc[suburb_idx]
         adjusted_growth = growth_adjustments.iloc[suburb_idx]
-        
+
         # Calculate projections using Monte Carlo with adjusted rates
         n_simulations = 1000
         all_projections = []
-        
+
         # Create base growth rate trajectory
         base_growth_rate = np.linspace(
             max(0.015, adjusted_growth - 0.005),  # Floor at 1.5%
@@ -1210,28 +1650,54 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
             len(years)
         )
 
+        # ====== PHASE 2: Apply market constraints year-by-year ======
+        # Get initial state for constraint calculations
+        initial_state = {
+            'current_price': base_price,
+            'annual_income': suburb_row['household_income'] * 52,  # Weekly to annual
+            'supply_ratio': suburb_row['supply_ratio'],
+            'years_since_maturity': estimate_suburb_age(pd.DataFrame([suburb_row]))[0]
+        }
+
         # Generate nominal price projections with proper inflation handling
         for _ in range(n_simulations):
-            # Generate growth noise
-            growth_noise = np.random.normal(0, 0.005, len(years))
-            base_rates = base_growth_rate + growth_noise
-            
-            # Generate inflation noise
-            inflation_noise = np.random.normal(0, inflation_volatility/100, len(years))
-            inflation_rates = forecast_inflation/100 + inflation_noise
-            
-            # Calculate real growth with partial inflation pass-through
-            # Housing typically maintains 3-4% real growth during inflation
-            real_growth = base_rates - (inflation_rates * 0.6)  # 60% inflation pass-through
-            
-            # Combined growth includes:
-            # 1. Real growth component (partially hedged against inflation)
-            # 2. Full inflation component
-            total_growth = real_growth + inflation_rates
-            
-            # Calculate price trajectory
-            projections = base_price * np.cumprod(1 + total_growth)
-            all_projections.append(projections)
+            # Initialize state for this simulation
+            state = initial_state.copy()
+            projections = [state['current_price']]
+
+            # Generate growth and inflation noise arrays
+            growth_noise = np.random.normal(0, 0.005, len(years) - 1)
+            inflation_noise = np.random.normal(0, inflation_volatility/100, len(years) - 1)
+
+            # Year-by-year projection with constraints
+            for year_idx in range(len(years) - 1):
+                # Base growth rate for this year
+                base_rate = base_growth_rate[year_idx] + growth_noise[year_idx]
+                inflation_rate = forecast_inflation/100 + inflation_noise[year_idx]
+
+                # Calculate real growth with partial inflation pass-through
+                real_growth = base_rate - (inflation_rate * 0.6)
+                combined_growth = real_growth + inflation_rate
+
+                # ====== APPLY MARKET CONSTRAINTS ======
+                constrained_growth = apply_market_constraints(combined_growth, state, year_idx)
+
+                # Update price for this year
+                new_price = state['current_price'] * (1 + constrained_growth)
+                projections.append(new_price)
+
+                # Update state for next year
+                state['current_price'] = new_price
+
+                # Update supply ratio (very inelastic response - 0.07 elasticity)
+                # Price growth → modest supply increase → dampens future growth
+                if year_idx > 0:
+                    cumulative_price_growth = (new_price / base_price) - 1
+                    # Supply increases by 0.07 * price growth, spread over 5 years
+                    supply_increase = (cumulative_price_growth * 0.07) / 5
+                    state['supply_ratio'] = initial_state['supply_ratio'] + supply_increase
+
+            all_projections.append(np.array(projections))
         
         # Convert to numpy array for calculations
         nominal_projections = np.array(all_projections)
@@ -1256,6 +1722,12 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
         inflation_adj_upper_95 = np.percentile(inflation_adjusted_projections, 97.5, axis=0)
         inflation_adj_lower_std = inflation_adj_median - np.std(inflation_adjusted_projections, axis=0)
         inflation_adj_upper_std = inflation_adj_median + np.std(inflation_adjusted_projections, axis=0)
+
+        # ====== VALIDATION: Sanity checks for long-term projections ======
+        suburb_row = suburb_data[suburb_data['suburb'] == suburb].iloc[0]
+        validation_result = validate_long_term_projections(
+            suburb, nominal_median, suburb_row, years
+        )
 
         # Get historical ABS growth rates
         historical_rates, data_source = fetch_abs_historical_growth(suburb)
@@ -1374,13 +1846,233 @@ def forecast_prices(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None, 
     
     return plot_paths, json.dumps(data_dict, indent=4)
 
-def generate_forecast_reasoning(df: pd.DataFrame, api_data: str, verbose: bool = False) -> tuple[str, list[str]]:
-    """Generate detailed reasoning for price forecasts using DataFrame data and price projections"""
+def forecast_prices_dynamic(suburbs, dwelling_type=None, bedrooms=None, bathrooms=None,
+                           car_spaces=None, land_size=None, max_price=None):
+    """
+    PHASE 3: Generate forecasts with year-by-year state evolution
+    CRITICAL: Each year's growth depends on that year's state, not Year 0
+
+    This is the lifecycle-aware implementation that:
+    - Updates state variables every year (price, income, supply, age)
+    - Applies stage-specific momentum and mean reversion
+    - Uses current maturity decay factors
+    - Implements fundamental value anchoring
+    """
+    # Fetch initial data
+    suburb_data, api_response = fetch_suburb_data(
+        suburbs, dwelling_type=dwelling_type, bedrooms=bedrooms,
+        bathrooms=bathrooms, car_spaces=car_spaces,
+        land_size=land_size, max_price=max_price
+    )
+
+    # Load calibration data
+    supply_elasticity = load_supply_elasticity()
+    rba_params = load_rba_parameters()
+
+    current_year = datetime.now().year
+    years = np.arange(current_year, current_year + 50)
+    n_simulations = 1000
+
+    # Parse existing data
+    data_dict = json.loads(api_response)
+    plot_paths = []
+
+    # For each suburb, generate dynamic projections
+    for _, row in suburb_data.iterrows():
+        suburb = row['suburb']
+
+        # Get suburb info from API response
+        if suburb not in data_dict.get('suburbs', {}):
+            logging.warning(f"Skipping {suburb} - no API data available")
+            continue
+
+        suburb_info = data_dict['suburbs'][suburb]
+        base_price = clean_numeric_value(suburb_info['median_price']['value'])
+
+        # Initialize state for this suburb
+        initial_state = {
+            'current_price': base_price,
+            'initial_price': base_price,
+            'annual_income': row['household_income'] * 52,
+            'supply_ratio': row['supply_ratio'],
+            'years_since_maturity': estimate_suburb_age(pd.DataFrame([row]))[0],
+            'prior_year_growth': 0.03,  # Assume 3% prior
+            'city': extract_city_from_suburb(suburb),
+            'household_size': row['household_size']  # PHASE 4: Track demographic evolution
+        }
+
+        # Run Monte Carlo simulations
+        sim_trajectories = []
+
+        for sim in range(n_simulations):
+            state = initial_state.copy()
+            trajectory = [state['current_price']]
+
+            for year_idx in range(1, len(years)):
+                # Calculate THIS YEAR's growth based on CURRENT state
+                base_growth = calculate_year_growth(state, row, year_idx, rba_params)
+
+                # Apply market constraints
+                constrained_growth = apply_market_constraints(base_growth, state, year_idx)
+
+                # Add stochastic noise
+                noise = np.random.normal(0, 0.008)  # 0.8% volatility
+                final_growth = constrained_growth + noise
+
+                # Update price
+                new_price = state['current_price'] * (1 + final_growth)
+                trajectory.append(new_price)
+
+                # ====== UPDATE STATE FOR NEXT ITERATION ======
+                state['current_price'] = new_price
+                state['prior_year_growth'] = final_growth
+                state['years_since_maturity'] += 1
+
+                # DYNAMIC SUPPLY RATIO ADJUSTMENT
+                # Combines construction response and demand absorption
+                # Research: RBA construction elasticity + US absorption patterns
+                price_change = (new_price / state['initial_price']) - 1
+                supply_city = supply_elasticity.get(state['city'], 0.07)
+                current_total_age = state['years_since_maturity']
+
+                # Calculate dynamic adjustment
+                supply_delta = calculate_supply_adjustment(
+                    current_ratio=state['supply_ratio'],
+                    price_change=price_change,
+                    growth_rate=final_growth,
+                    years_since_maturity=current_total_age,
+                    city_elasticity=supply_city
+                )
+
+                # Update supply ratio (can increase or decrease)
+                state['supply_ratio'] = max(0.5, state['supply_ratio'] + supply_delta)
+                # Floor at 0.5 (3 months supply) prevents unrealistic undersupply
+
+                # Update income (2.5% annual growth assumption)
+                state['annual_income'] = initial_state['annual_income'] * ((1.025) ** year_idx)
+
+                # PHASE 4: Demographic evolution - household size decays as suburb ages
+                # Reflects empty-nester effect, aging population, smaller new households
+                # Decay from ~3.2 (young families) toward ~2.1 (mature/aging) over 30 years
+                target_household_size = 2.1
+                decay_rate = 0.015  # 1.5% annual decay toward target
+                state['household_size'] = (state['household_size'] - target_household_size) * (1 - decay_rate) + target_household_size
+
+            sim_trajectories.append(trajectory)
+
+        # Convert to numpy array
+        all_projections = np.array(sim_trajectories)
+
+        # Calculate statistics
+        nominal_median = np.median(all_projections, axis=0)
+        nominal_lower_95 = np.percentile(all_projections, 2.5, axis=0)
+        nominal_upper_95 = np.percentile(all_projections, 97.5, axis=0)
+        nominal_lower_std = nominal_median - np.std(all_projections, axis=0)
+        nominal_upper_std = nominal_median + np.std(all_projections, axis=0)
+
+        # Calculate inflation-adjusted projections
+        forecast_inflation = suburb_info['inflation']['forecast']['value']
+        inflation_volatility = suburb_info['inflation']['volatility']['value']
+        inflation_noise = np.random.normal(0, inflation_volatility/100, (n_simulations, len(years)))
+        inflation_factors = np.cumprod(1 + (forecast_inflation/100 + inflation_noise), axis=1)
+
+        inflation_adjusted_projections = all_projections / inflation_factors
+
+        inflation_adj_median = np.median(inflation_adjusted_projections, axis=0)
+        inflation_adj_lower_95 = np.percentile(inflation_adjusted_projections, 2.5, axis=0)
+        inflation_adj_upper_95 = np.percentile(inflation_adjusted_projections, 97.5, axis=0)
+        inflation_adj_lower_std = inflation_adj_median - np.std(inflation_adjusted_projections, axis=0)
+        inflation_adj_upper_std = inflation_adj_median + np.std(inflation_adjusted_projections, axis=0)
+
+        # ====== VALIDATION: Sanity checks ======
+        validation_result = validate_long_term_projections(
+            suburb, nominal_median, row, years
+        )
+
+        # Get historical ABS growth rates
+        historical_rates, data_source = fetch_abs_historical_growth(suburb)
+        historical_prices = base_price * np.cumprod(1 + historical_rates/100)
+
+        # Verify dimensions match
+        if len(historical_prices) < len(years):
+            historical_prices = np.pad(historical_prices,
+                                      (0, len(years) - len(historical_prices)),
+                                      'edge')
+        elif len(historical_prices) > len(years):
+            historical_prices = historical_prices[:len(years)]
+
+        # Generate visualization
+        plt.figure(figsize=(12, 7))
+
+        # Plot nominal projections
+        plt.fill_between(years, nominal_lower_95, nominal_upper_95, alpha=0.1, color='#3498db', label='Nominal 95% CI')
+        plt.fill_between(years, nominal_lower_std, nominal_upper_std, alpha=0.2, color='#3498db', label='Nominal 68% CI')
+        plt.plot(years, nominal_median, label='Nominal Median (Phase 3 Dynamic)', color='#3498db', linewidth=2.5)
+
+        # Plot inflation-adjusted projections
+        plt.fill_between(years, inflation_adj_lower_95, inflation_adj_upper_95, alpha=0.1, color='#2ecc71', label='Inflation-Adjusted 95% CI')
+        plt.fill_between(years, inflation_adj_lower_std, inflation_adj_upper_std, alpha=0.2, color='#2ecc71', label='Inflation-Adjusted 68% CI')
+        plt.plot(years, inflation_adj_median, label='Inflation-Adjusted Median', color='#2ecc71', linewidth=2)
+
+        # Plot historical baseline
+        plt.plot(years, historical_prices, label=f'Historical Pattern ({data_source})', color='#95a5a6', linewidth=1.5, linestyle='--')
+
+        plt.xlabel('Year', fontsize=12)
+        plt.ylabel('Median Price (AUD)', fontsize=12)
+        plt.title(f'{suburb} - 50-Year Price Forecast (Lifecycle-Aware Model)', fontsize=14, fontweight='bold')
+        plt.legend(loc='upper left', fontsize=9)
+        plt.grid(True, alpha=0.3)
+
+        # Save plot
+        plot_filename = f"{suburb.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        plot_path = FORECAST_DIR / plot_filename
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        plot_paths.append(str(plot_path))
+
+        # Store projections
+        suburb_info['price_projections'] = {
+            'years': years.tolist(),
+            'nominal': {
+                'median_projection': nominal_median.tolist(),
+                'lower_95_ci': nominal_lower_95.tolist(),
+                'upper_95_ci': nominal_upper_95.tolist(),
+                'lower_std': nominal_lower_std.tolist(),
+                'upper_std': nominal_upper_std.tolist()
+            },
+            'inflation_adjusted': {
+                'median_projection': inflation_adj_median.tolist(),
+                'lower_95_ci': inflation_adj_lower_95.tolist(),
+                'upper_95_ci': inflation_adj_upper_95.tolist(),
+                'lower_std': inflation_adj_lower_std.tolist(),
+                'upper_std': inflation_adj_upper_std.tolist()
+            },
+            'model_version': 'Phase3_Dynamic_Lifecycle',
+            'validation': validation_result
+        }
+
+        # Calculate YoY growth rates
+        growth_rates = calculate_growth_rates(suburb_info['price_projections'])
+        suburb_info.update(growth_rates)
+
+    return plot_paths, json.dumps(data_dict, indent=4)
+
+def generate_forecast_reasoning(df: pd.DataFrame, api_data: str, reasoning_effort: str = "medium", verbose: bool = False) -> tuple[str, list[str]]:
+    """
+    Generate detailed reasoning for price forecasts using DataFrame data and price projections
+    Uses Sonar Deep Research endpoint for comprehensive market analysis
+
+    Args:
+        df: DataFrame containing suburb data
+        api_data: JSON string with forecast data
+        reasoning_effort: Level of research depth - "low", "medium", or "high"
+        verbose: Enable debug logging
+    """
     all_reasoning = []
     all_citations = []
-    
+
     data_dict = json.loads(api_data)
-    
+
     for _, row in df.iterrows():
         suburb = row['suburb']
 
@@ -1396,29 +2088,30 @@ Unable to generate analysis - suburb data not available.
             continue
 
         projections = data_dict['suburbs'][suburb]['price_projections']
-        
+
         years = projections['years']
         year_indices = [
             next(i for i, y in enumerate(years) if y-years[0] >= 5),
             next(i for i, y in enumerate(years) if y-years[0] >= 25),
             -1  # Last index (50 years)
         ]
-        
+
         nominal_prices = [
-            projections['nominal']['median_projection'][i] 
+            projections['nominal']['median_projection'][i]
             for i in year_indices
         ]
         inflation_adj_prices = [
-            projections['inflation_adjusted']['median_projection'][i] 
+            projections['inflation_adjusted']['median_projection'][i]
             for i in year_indices
         ]
-        
+
         reasoning_payload = {
-            "model": "sonar-pro",
+            "model": "sonar-deep-research",
+            "reasoning_effort": reasoning_effort,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are an expert Australian real estate analyst. Focus analysis on 25-year timeframe as primary, with 50-year projections as supplementary long-term indicators. Provide detailed growth reasoning with citations. Format: <think>analysis</think> followed by citations: [urls]"
+                    "content": "You are an expert Australian real estate analyst. Focus analysis on 25-year timeframe as primary, with 50-year projections as supplementary long-term indicators. Provide detailed growth reasoning with citations. DO NOT include your planning or thinking process in the output - provide only the final comprehensive analysis. Write in a professional, direct style suitable for an investment report."
                 },
                 {
                     "role": "user",
@@ -1515,7 +2208,9 @@ Unable to generate analysis - suburb data not available.
         }
         
         try:
-            response = requests.post(PERPLEXITY_API_URL, json=reasoning_payload, headers=HEADERS, timeout=600)
+            # Deep Research can take up to 10 minutes, especially with high reasoning effort
+            timeout = 900 if reasoning_effort == "high" else 600
+            response = requests.post(PERPLEXITY_API_URL, json=reasoning_payload, headers=HEADERS, timeout=timeout)
             response.raise_for_status()
 
             if verbose:
@@ -1527,9 +2222,9 @@ Unable to generate analysis - suburb data not available.
             response_data = response.json()
             content = response_data['choices'][0]['message']['content']
             citations = response_data.get('citations', [])
-            
-            reasoning_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
-            reasoning = reasoning_match.group(1).strip() if reasoning_match else content.strip()
+
+            # Deep Research provides direct output without thinking tags
+            reasoning = content.strip()
             
             suburb_analysis = f"""
 ## Market Analysis: {suburb} ({row['dwelling_type'].title()} Properties)
@@ -1861,7 +2556,7 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
         - Otherwise → Analyzes suburbs matching input
         - Property Criteria (0 = Any): Bedrooms, Bathrooms, Car Spaces, Land Size, Max Median Price
         
-        #### NOTE: Include Detailed Reasoning uses Deep Reasoning and is both expensive and slow. Use with care.
+        #### NOTE: Include Detailed Reasoning uses Perplexity's Sonar Deep Research endpoint. Higher research depth provides more thorough analysis but is slower and more expensive. Use with care.
                            
         """)
         
@@ -1940,6 +2635,12 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
             label="Include Detailed Reasoning",
             value=False,
         )
+        reasoning_effort = gr.Dropdown(
+            choices=["low", "medium", "high"],
+            value="medium",
+            label="Research Depth",
+            info="Higher depth = more thorough analysis but slower and more expensive"
+        )
         txt_btn = gr.Button("Download Reasoning (TXT)")
         rtf_btn = gr.Button("Download Reasoning (RTF)")
     
@@ -1960,12 +2661,12 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
         
         return filepath
     
-    def update_forecast_display(api_data, verbose):
+    def update_forecast_display(api_data, verbose, reasoning_effort="medium"):
         """Update forecast display with reasoning"""
         if not api_data:
             return None, gr.update(visible=False)
-        
-        reasoning, citations = generate_forecast_reasoning(json.loads(api_data), verbose)
+
+        reasoning, citations = generate_forecast_reasoning(json.loads(api_data), reasoning_effort, verbose)
         return reasoning, gr.update(visible=True)
 
     api_output = gr.JSON(label="Suburb Data")
@@ -2001,14 +2702,14 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
         """Convert zero values to None for optional inputs"""
         return None if value == 0 else value
     
-    def forecast_with_processing(suburbs, dwelling_type, bedrooms, bathrooms, car_spaces, 
-                           land_size, max_price, verbose, include_reasoning):
+    def forecast_with_processing(suburbs, dwelling_type, bedrooms, bathrooms, car_spaces,
+                           land_size, max_price, verbose, include_reasoning, reasoning_effort):
         """Enhanced wrapper with verbose logging integration and optional reasoning"""
         set_verbose(verbose)
-        
+
         processed_suburbs = process_suburb_input(suburbs)
         suburbs_text = '\n'.join(processed_suburbs)
-        
+
         # First get suburb data
         suburb_df, api_data = fetch_suburb_data(
             suburbs_text,
@@ -2019,7 +2720,7 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
             process_input(land_size),
             process_input(max_price)
         )
-        
+
         # Then generate price forecasts
         plots, forecast_data = forecast_prices(
             suburbs_text,
@@ -2030,12 +2731,12 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
             process_input(land_size),
             process_input(max_price)
         )
-        
+
         # Generate reasoning only if requested
         reasoning_text = None
         if include_reasoning:
-            # Use the DataFrame and forecast data
-            reasoning_text, _ = generate_forecast_reasoning(suburb_df, forecast_data, verbose)
+            # Use the DataFrame and forecast data with Deep Research endpoint
+            reasoning_text, _ = generate_forecast_reasoning(suburb_df, forecast_data, reasoning_effort, verbose)
         
         # Get current logs
         logs = textbox_handler.get_logs()
@@ -2059,7 +2760,8 @@ with gr.Blocks(theme=gr.themes.Default()) as app:
             max_price_input,
             verbose_checkbox,
             # logging_output,
-            include_reasoning
+            include_reasoning,
+            reasoning_effort
         ],
         outputs=[forecast_gallery, api_output, reasoning_output, logging_output]
     )

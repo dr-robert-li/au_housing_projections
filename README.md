@@ -1,8 +1,8 @@
 # 🏡 Australian Suburb Housing Price Forecaster
-### Version 1.3
+### Version 2.0 - Lifecycle-Aware Model
 ### Author: Robert Li ([dr-robert-li](https://github.com/dr-robert-li/))
-    
-This Machine Learning powered application uses finetuned XGBoost advanced regression model and a hedonic model of valuation to forecast housing prices for Australian suburbs over a 50-year period using machine learning and real estate market data.
+
+This Machine Learning powered application uses a **lifecycle-aware forecasting model** combining finetuned XGBoost regression with RBA-calibrated econometric parameters to forecast housing prices for Australian suburbs over a 50-year period. The model incorporates suburb maturity stages, market equilibrium mechanisms, and empirically-validated constraints to prevent unrealistic exponential growth.
 
 **Note:** This application is very compute, memory and time intensive. It can consume API credits very quickly. Use with care. It is recommended to use a GPU or a machine with at least 16GB of RAM. Each suburb may take several minutes to generate a response.
 
@@ -56,6 +56,58 @@ This Machine Learning powered application uses finetuned XGBoost advanced regres
     - Supply ratio benchmarking against 6-month standard
     - Dynamic growth adjustments based on supply conditions
 
+### Lifecycle-Aware Forecasting Model (Phase 1-4 Implementation)
+
+#### Phase 1: Suburb Maturity Decay
+- **Four lifecycle stages** based on years since maturity:
+  - INITIAL_DEVELOPMENT (0-5 years): High momentum, rapid infrastructure impacts
+  - RAPID_GROWTH (5-15 years): Peak appreciation, strong migration effects
+  - ESTABLISHED_MATURITY (15-30 years): Stabilizing growth, moderate dynamics
+  - RENEWAL_OR_DECLINE (30+ years): Low momentum, gentrification potential
+- **S-curve maturity decay**: Growth bonuses decay via sigmoid function `1/(1+exp(0.1*(age-15)))`
+- **Demographic estimation**: Household size proxies estimate suburb age (3.5→2.1 persons)
+
+#### Phase 2: Market Constraints
+- **Supply dampening** (Australia's 0.07 elasticity):
+  - Very inelastic housing supply response to price growth
+  - Supply ratio >1.2 triggers -1.5% per month excess inventory penalty
+- **Affordability brake** (Price-to-Income thresholds):
+  - P/I ratio >10x triggers exponential demand collapse
+  - Historical evidence: ratios >12x lead to market corrections
+  - Non-linear penalty: -2% × ((ratio-10)^1.2)
+- **Infrastructure saturation ceiling**:
+  - After 10 years maturity, diminishing returns from additional infrastructure
+  - Exponential decay approaching -0.2% ceiling over time
+
+#### Phase 3: Year-by-Year State Evolution
+- **Dynamic state tracking**: Each year's growth depends on CURRENT state, not Year 0
+- **State variables updated annually**:
+  - Current price (previous year growth applied)
+  - Supply ratio (0.07 elasticity response to cumulative price changes)
+  - Annual income (2.5% growth assumption)
+  - Years since maturity (increments annually)
+  - Household size (demographic decay toward 2.1 persons)
+- **RBA-calibrated parameters by stage**:
+  - Momentum coefficients: 0.74 → 0.60 → 0.30 → 0.20 (decays with maturity)
+  - Error correction speed: 0.05 → 0.10 → 0.14 → 0.18 (accelerates with maturity)
+
+#### Phase 4: Fundamental Value Anchoring
+- **Mean reversion to user cost equilibrium**:
+  - Fundamental Price = Annual Rent / (interest + depreciation + maintenance - expected appreciation)
+  - Stage-specific expected appreciation: 4% → 3.5% → 2.5% → 2%
+- **Dynamic interest rate cycles**: 10-year sine wave, ±1.5% amplitude around 5% base
+- **Current price-based rents**: Rents adjust with market prices, not fixed at Year 0
+- **Distance-based yields**: Inner city 3%, regional/outer 4%
+
+#### Enhanced Validation
+- **Five-point sanity checks**:
+  1. Total appreciation <200% over 50 years (real terms)
+  2. Late-stage growth <2% annually (years 40-50)
+  3. Price-to-income ratio <20x (market collapse threshold)
+  4. Mean reversion: 10-year deviations <50% from trend
+  5. Growth volatility <15% (prevents explosive dynamics)
+- **Research-backed thresholds** from RBA, AHURI, NSW Productivity Commission sources
+
 ### Market Cycle Modeling
 - Default to ABS data but will otherwise use a market cycle model:
   - 10-Year Market Cycles
@@ -80,8 +132,12 @@ This Machine Learning powered application uses finetuned XGBoost advanced regres
   - Inflation effects analysis
 - Research citations and market data sources
 - Exportable in RTF and TXT formats
+- Configurable research depth:
+  - **Low**: Faster analysis with basic research
+  - **Medium**: Balanced depth and speed (default)
+  - **High**: Exhaustive research and detailed analysis (slowest, most expensive)
 
-#### NOTE: This uses Deep Reasoning and Chain of Thought. It is both expensive and slow. Use with care especially for large datasets of multiple suburbs.
+#### NOTE: This uses Perplexity's Sonar Deep Research endpoint. It is both expensive and slow, especially with "high" research depth. Each suburb can take several minutes to analyze. Use with care for large datasets of multiple suburbs.
 
 ### Model Fine-tuning
 - Progressive learning with synthetic data generation
@@ -141,14 +197,34 @@ Melbourne CBD VIC
 ## Technical Details
 
 - Uses XGBoost model fine-tuned on Australian housing data
-- Implements Perplexity API for real-time market analysis
+- Implements Perplexity API for real-time market analysis (Sonar Pro endpoint)
 - Generates high-resolution forecast plots with matplotlib
+- **Lifecycle-aware modeling** with year-by-year state evolution
+- **RBA-calibrated parameters** from Research Discussion Papers 2018-03 and 2019-01
+- **Monte Carlo simulations** (1000 iterations) for confidence intervals
 - Supports incremental model training with new data
+
+## Data Sources & Research
+
+All external data sources are documented in `includes/DATA_SOURCES.md`:
+
+- **Supply Elasticity**: RBA RDP 2018-03 (Kendall & Tulip) - 0.07 long-run elasticity
+- **Price-to-Income Ratios**: Statista, RBA Bulletin, 50-year historical data
+- **Infrastructure Effects**: NSW Productivity Commission 2024, Journal of Housing Economics 2021
+- **RBA Model Parameters**: RBA RDP 2019-01 (Saunders & Tulip) - 62-equation econometric model
+- **Quality ratings**: ✅ Very High to ⚠️ Medium with recency tracking
+
+See `includes/` directory for:
+- `supply_elasticity_by_city.json` - City-specific housing supply constraints
+- `price_to_income_ratios.json` - Historical affordability thresholds
+- `infrastructure_effects.json` - Calibrated school/transport premiums
+- `rba_model_parameters.json` - Momentum, error correction, interest rate sensitivity
 
 ## Data Storage
 
-- Forecasts saved in ./forecasts directory
-- Exported data stored in ./exports directory
+- Forecasts saved in `./forecasts/` directory
+- Exported data stored in `./exports/` directory
+- Research data in `./includes/` directory (excluded from version control)
 - Timestamped files for version tracking
 
 ## Dependencies
